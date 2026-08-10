@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
+	"github.com/kimoju/quectel-qmi-go/pkg/qmi"
 )
 
 func waitManagerEvent(t *testing.T, ch <-chan Event) Event {

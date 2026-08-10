@@ -68,6 +68,7 @@ type ClientLogFunc func(level ClientLogLevel, format string, args ...any)
 // ClientOptions controls runtime behavior for the low-level QMI client.
 type ClientOptions struct {
 	SyncOnOpen            bool
+	QueryVersionOnOpen    bool // 启动时自动查询服务版本信息
 	ReadDeadline          time.Duration
 	DefaultRequestTimeout time.Duration
 	TxQueueSize           int
@@ -84,6 +85,7 @@ type ClientOptions struct {
 func DefaultClientOptions() ClientOptions {
 	return ClientOptions{
 		SyncOnOpen:            true,
+		QueryVersionOnOpen:    true,
 		ReadDeadline:          100 * time.Millisecond,
 		DefaultRequestTimeout: 30 * time.Second,
 		TxQueueSize:           128,
@@ -146,6 +148,10 @@ type Client struct {
 	path string
 	opts ClientOptions
 
+	// 服务版本缓存 (由 GetServiceVersions 填充)
+	serviceVersions map[uint8]ServiceVersion
+	versionQueried  bool
+
 	// Transaction management / 事务管理
 	mu                     sync.Mutex
 	transactions           map[uint32]*transactionEntry
@@ -207,6 +213,13 @@ func normalizeClientOptions(opts ClientOptions) ClientOptions {
 		opts.TxQueueSize == defaults.TxQueueSize &&
 		opts.IndicationQueueSize == defaults.IndicationQueueSize {
 		opts.SyncOnOpen = defaults.SyncOnOpen
+	}
+	if !opts.QueryVersionOnOpen &&
+		opts.ReadDeadline == defaults.ReadDeadline &&
+		opts.DefaultRequestTimeout == defaults.DefaultRequestTimeout &&
+		opts.TxQueueSize == defaults.TxQueueSize &&
+		opts.IndicationQueueSize == defaults.IndicationQueueSize {
+		opts.QueryVersionOnOpen = defaults.QueryVersionOnOpen
 	}
 	return opts
 }
@@ -298,7 +311,61 @@ func NewClientWithOptions(ctx context.Context, path string, opts ClientOptions) 
 		}
 	}
 
+	// Query version info (non-fatal) / 查询版本信息 (非致命)
+	if opts.QueryVersionOnOpen {
+		versionCtx := ctx
+		if versionCtx == nil {
+			versionCtx = context.Background()
+		}
+		if _, hasDeadline := versionCtx.Deadline(); !hasDeadline {
+			var cancel context.CancelFunc
+			versionCtx, cancel = context.WithTimeout(versionCtx, 5*time.Second)
+			defer cancel()
+		}
+		if versions, err := c.GetServiceVersions(versionCtx); err != nil {
+			c.logf(ClientLogLevelDebug, "QMI: version info query failed (non-fatal): %v", err)
+		} else {
+			c.serviceVersions = ServiceVersionMap(versions)
+			c.versionQueried = true
+			c.logf(ClientLogLevelDebug, "QMI: modem 支持 %d 个 QMI 服务", len(versions))
+		}
+	}
+
 	return c, nil
+}
+
+// HasService 查询 modem 是否支持指定的 QMI 服务。
+// 如果尚未执行版本查询，返回 true（乐观假设）。
+func (c *Client) HasService(service uint8) bool {
+	if !c.versionQueried {
+		return true
+	}
+	_, ok := c.serviceVersions[service]
+	return ok
+}
+
+func (c *Client) ensureServiceAllocatable(service uint8) error {
+	if !c.versionQueried {
+		return nil
+	}
+	if _, ok := c.serviceVersions[service]; ok {
+		return nil
+	}
+	return ErrServiceNotSupported
+}
+
+// GetCachedServiceVersions 返回缓存的服务版本信息。
+// 如果尚未查询过，返回 nil。
+func (c *Client) GetCachedServiceVersions() map[uint8]ServiceVersion {
+	if !c.versionQueried {
+		return nil
+	}
+	// 返回浅拷贝，避免外部修改
+	result := make(map[uint8]ServiceVersion, len(c.serviceVersions))
+	for k, v := range c.serviceVersions {
+		result[k] = v
+	}
+	return result
 }
 
 func newClientWithTransport(path string, opts ClientOptions, conn qmiTransport) *Client {
@@ -925,7 +992,7 @@ func (c *Client) SendRequest(ctx context.Context, service uint8, clientID uint8,
 
 // Sync sends a QMI CTL sync request / Sync发送QMI CTL同步请求
 func (c *Client) Sync(ctx context.Context) error {
-	_, err := c.SendRequest(ctx, ServiceControl, 0, 0x0027, nil) // 0x0027 = QMICTL_SYNC_REQ
+	_, err := c.SendRequest(ctx, ServiceControl, 0, CTLSync, nil)
 	return err
 }
 
@@ -950,6 +1017,10 @@ func (c *Client) AllocateClientID(service uint8) (uint8, error) {
 }
 
 func (c *Client) AllocateClientIDWithContext(ctx context.Context, service uint8) (uint8, error) {
+	if err := c.ensureServiceAllocatable(service); err != nil {
+		return 0, err
+	}
+
 	var lastErr error
 	for retry := 0; retry < 3; retry++ {
 		attemptCtx, attemptCancel := context.WithTimeout(ctx, 20*time.Second)

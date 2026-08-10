@@ -177,3 +177,11 @@ func IsTimeoutError(err error) bool {
 	_, ok := err.(*TimeoutError)
 	return ok
 }
+
+// ============================================================================
+// Gate Error / 门控拦截错误
+// ============================================================================
+
+// ErrServiceNotSupported is returned when a requested service is not supported by the hardware
+// ErrServiceNotSupported 表示硬件不支持所请求的 QMI 服务
+var ErrServiceNotSupported = errors.New("qmi service not supported by hardware")

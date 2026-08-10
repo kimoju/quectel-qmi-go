@@ -9,7 +9,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
+	"github.com/kimoju/quectel-qmi-go/pkg/qmi"
 )
 
 func main() {

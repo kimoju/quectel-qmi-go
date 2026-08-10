@@ -15,8 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/iniwex5/quectel-qmi-go/pkg/netcfg"
-	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
+	"github.com/kimoju/quectel-qmi-go/pkg/netcfg"
+	"github.com/kimoju/quectel-qmi-go/pkg/qmi"
 	"github.com/warthog618/sms"
 	"github.com/warthog618/sms/encoding/tpdu"
 	"github.com/warthog618/sms/encoding/ucs2"
@@ -121,6 +121,8 @@ type RecoveryPolicy struct {
 	ServiceTimeoutThreshold       int
 	ServiceTimeoutWindow          time.Duration
 	ServiceRecoverCooldown        time.Duration
+	MaxRecoverAttempts            int           // >0 时，核心恢复连续重试超过该次数即放弃并发终态事件；0 = 无限（默认，向后兼容）
+	MaxRecoverElapsed             time.Duration // >0 时，自首次恢复失败起超过该时长即放弃并发终态事件；0 = 不启用（默认）
 }
 
 type ManagerStats struct {
@@ -185,12 +187,13 @@ type Manager struct {
 	events  *EventEmitter // External event callbacks / 外部事件回调
 
 	// Reconnection / 重连相关
-	retryCount   int
-	retryDelays  []time.Duration
-	reinitDelays []time.Duration
-	isRotating   bool // Flag to suppress status checks during IP rotation / 标志位: IP轮换期间抑制状态检查
-	recoverCount int
-	lastIPCheck  time.Time
+	retryCount         int
+	retryDelays        []time.Duration
+	reinitDelays       []time.Duration
+	isRotating         bool // Flag to suppress status checks during IP rotation / 标志位: IP轮换期间抑制状态检查
+	recoverCount       int
+	recoverFirstFailAt time.Time // 本轮连续恢复失败的首次时间，用于 MaxRecoverElapsed 判据
+	lastIPCheck        time.Time
 
 	// Internal notification / 内部通知
 	regNotify chan bool // For fast registration detection / 用于快速注册检测
@@ -221,6 +224,10 @@ type Manager struct {
 	wmsReplayInProgress     bool
 	serviceTimeoutMu        sync.Mutex
 	serviceTimeoutFailures  map[serviceTimeoutKey]serviceTimeoutWindow
+
+	globalTimeoutMu       sync.Mutex
+	globalTimeoutServices map[string]time.Time
+	globalTimeoutStormAt  time.Time
 
 	// SMS recovery state / 短信恢复状态
 	lastKnownGoodRoutes        *qmi.WMSRouteConfig
@@ -362,6 +369,12 @@ const defaultPostRegRefreshCooldown = 2 * time.Second
 const recoverBackoffBase = 500 * time.Millisecond
 const recoverBackoffMax = 15 * time.Second
 const recoverBackoffJitterRatio = 0.2
+
+// fullCheckJitterRatio 是健康检查周期 (HealthPolicy.FullCheckInterval) 每次重新调度时
+// 附加的随机抖动比例。多个 Manager 实例（如双模组共用同一个 qmi-proxy 时）若各自的
+// 检查周期固定且启动时间相近，会长期保持锁相，导致周期性同时向 proxy 发起突发请求；
+// 每次 tick 后用新的随机间隔重新调度，能持续打散这种对齐，而不只是一次性错开。
+const fullCheckJitterRatio = 0.2
 
 var (
 	smsReadyWaitTimeout   = 8 * time.Second
@@ -2294,7 +2307,7 @@ func (m *Manager) setState(s State) {
 }
 
 type startupServiceTask struct {
-	run  func(context.Context) error
+	run func(context.Context) error
 }
 
 func (m *Manager) runStartupServiceTasks(ctx context.Context, fatal bool, tasks []startupServiceTask) error {
@@ -2346,6 +2359,15 @@ func (m *Manager) runStartupServiceTasks(ctx context.Context, fatal bool, tasks 
 		return firstErr
 	}
 	return nil
+}
+
+// hasQMIService 检查底层 Client 是否声明支持该服务。
+// 仅在 client 初始化完成后调用有效。
+func (m *Manager) hasQMIService(service uint8) bool {
+	if m.client == nil {
+		return false
+	}
+	return m.client.HasService(service)
 }
 
 func (m *Manager) allocateServices(ctx context.Context) error {
@@ -2444,6 +2466,10 @@ func (m *Manager) allocateServices(ctx context.Context) error {
 					m.log.Debug("Skipping WMS client allocation")
 					return nil
 				}
+				if !m.hasQMIService(qmi.ServiceWMS) {
+					m.log.Debug("Skipping WMS client allocation (modem not supported)")
+					return nil
+				}
 				m.log.Debug("Allocating WMS client...")
 				wms, err := m.createWMSService(taskCtx)
 				if err != nil {
@@ -2460,6 +2486,10 @@ func (m *Manager) allocateServices(ctx context.Context) error {
 		},
 		{
 			run: func(taskCtx context.Context) error {
+				if !m.hasQMIService(qmi.ServiceVOICE) {
+					m.log.Debug("Skipping VOICE client allocation (modem not supported)")
+					return nil
+				}
 				m.log.Debug("Allocating VOICE client...")
 				voice, err := m.createVOICEService(taskCtx)
 				if err != nil {
@@ -2884,8 +2914,8 @@ func runCleanupTasks(ctx context.Context, log Logger, tasks []cleanupTask) []cle
 func (m *Manager) eventLoop() {
 	defer m.wg.Done()
 
-	checkTicker := time.NewTicker(m.cfg.HealthPolicy.FullCheckInterval)
-	defer checkTicker.Stop()
+	checkTimer := time.NewTimer(jitteredFullCheckInterval(m.cfg.HealthPolicy.FullCheckInterval))
+	defer checkTimer.Stop()
 
 	for {
 		select {
@@ -2895,8 +2925,9 @@ func (m *Manager) eventLoop() {
 		case evt := <-m.eventCh:
 			m.handleEvent(evt)
 
-		case <-checkTicker.C:
+		case <-checkTimer.C:
 			m.eventCh <- eventCheckFull
+			checkTimer.Reset(jitteredFullCheckInterval(m.cfg.HealthPolicy.FullCheckInterval))
 		}
 	}
 }
@@ -3063,6 +3094,13 @@ func (m *Manager) doRecoverFromModemReset() bool {
 		m.markCoreNotReadyLocked("recover_reinit_services", openErr)
 		m.mu.Unlock()
 		m.setState(StateDisconnected)
+		if m.isControlDeviceGone() {
+			m.log.WithError(openErr).Warn("Control device node missing; emitting device_removed terminal event")
+			m.recoverCount = 0
+			m.recoverFirstFailAt = time.Time{}
+			m.emitEvent(Event{Type: EventRecoveryExhausted, State: StateDisconnected, Error: openErr, Reason: "device_removed"})
+			return false
+		}
 		m.scheduleRecoverRetry("reinit_failed")
 		return false
 	}
@@ -3112,6 +3150,7 @@ func (m *Manager) doRecoverFromModemReset() bool {
 	}
 
 	m.recoverCount = 0
+	m.recoverFirstFailAt = time.Time{}
 	m.recoverBackoffMs.Store(0)
 	m.recoverSuccess.Add(1)
 
@@ -3199,8 +3238,45 @@ func (m *Manager) waitIdentityReadable(ctx context.Context) error {
 	}
 }
 
+// isControlDeviceGone 仅在配置了控制口路径且该节点确实不存在时返回 true。
+func (m *Manager) isControlDeviceGone() bool {
+	path := m.cfg.Device.ControlPath
+	if path == "" {
+		return false
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return true
+	}
+	return false
+}
+
+// recoveryExhausted 判断核心恢复是否应放弃重试（仅在策略启用时返回 true）。
+func (m *Manager) recoveryExhausted() bool {
+	p := m.cfg.RecoveryPolicy
+	if p.MaxRecoverAttempts > 0 && m.recoverCount > p.MaxRecoverAttempts {
+		return true
+	}
+	if p.MaxRecoverElapsed > 0 && !m.recoverFirstFailAt.IsZero() &&
+		time.Since(m.recoverFirstFailAt) >= p.MaxRecoverElapsed {
+		return true
+	}
+	return false
+}
+
 func (m *Manager) scheduleRecoverRetry(reason string) {
 	m.recoverCount++
+	if m.recoverFirstFailAt.IsZero() {
+		m.recoverFirstFailAt = time.Now()
+	}
+	if m.recoveryExhausted() {
+		m.log.WithField("reason", reason).
+			WithField("attempts", m.recoverCount).
+			Warn("Core recovery exhausted; emitting terminal event and stopping retries")
+		m.recoverCount = 0
+		m.recoverFirstFailAt = time.Time{}
+		m.emitEvent(Event{Type: EventRecoveryExhausted, State: StateDisconnected, Reason: "recovery_exhausted"})
+		return
+	}
 	delay := m.getRecoverDelay()
 	m.log.WithField("reason", reason).Infof("Will retry reinit with backoff in %v (attempt=%d)", delay, m.recoverCount)
 	m.scheduleAfter(delay, func() {
@@ -3239,6 +3315,24 @@ func (m *Manager) getRecoverDelay() time.Duration {
 
 	m.recoverBackoffMs.Store(uint64(delay / time.Millisecond))
 	return delay
+}
+
+// jitteredFullCheckInterval 在 base 基础上加 ±fullCheckJitterRatio 的随机抖动。
+// base<=0 时回退到 defaultHealthPolicy.FullCheckInterval。
+func jitteredFullCheckInterval(base time.Duration) time.Duration {
+	if base <= 0 {
+		base = defaultHealthPolicy.FullCheckInterval
+	}
+	jitterRange := time.Duration(float64(base) * fullCheckJitterRatio)
+	if jitterRange <= 0 {
+		return base
+	}
+	jitter := time.Duration(rand.Int63n(int64(jitterRange)*2+1)) - jitterRange
+	result := base + jitter
+	if result <= 0 {
+		return base
+	}
+	return result
 }
 
 func (m *Manager) doConnect() error {
@@ -3508,6 +3602,23 @@ func (m *Manager) configureNetwork() error {
 		if err != nil {
 			m.log.WithError(err).Warn("Failed to get IPv6 settings")
 		} else {
+			// Merge IPv6 fields into m.settings so Settings() exposes both
+			// families regardless of whether the IPv4 leg is active.
+			// IPv6需要合并进m.settings，这样无论IPv4是否启用，Settings()都能返回双栈信息。
+			m.mu.Lock()
+			if m.settings == nil {
+				m.settings = &qmi.RuntimeSettings{}
+			}
+			m.settings.IPv6Address = settingsV6.IPv6Address
+			m.settings.IPv6Prefix = settingsV6.IPv6Prefix
+			m.settings.IPv6Gateway = settingsV6.IPv6Gateway
+			m.settings.IPv6DNS1 = settingsV6.IPv6DNS1
+			m.settings.IPv6DNS2 = settingsV6.IPv6DNS2
+			if m.settings.MTU == 0 {
+				m.settings.MTU = settingsV6.MTU
+			}
+			m.mu.Unlock()
+
 			if settingsV6.IPv6Address != nil {
 				m.log.Infof("Configuring IPv6: %s/%d", settingsV6.IPv6Address, settingsV6.IPv6Prefix)
 				if err := netcfg.SetIPv6Address(ifname, settingsV6.IPv6Address, int(settingsV6.IPv6Prefix)); err != nil {
@@ -3789,29 +3900,60 @@ func (m *Manager) handleIndication(evt qmi.Event) {
 
 			hasServingTLV := qmi.FindTLV(evt.Packet.TLVs, 0x01) != nil
 			hasPLMNTLV := qmi.FindTLV(evt.Packet.TLVs, 0x12) != nil
-			m.log.Debugf("NAS serving indication TLVs: has_0x01=%v has_0x12=%v", hasServingTLV, hasPLMNTLV)
 			if hasServingTLV || hasPLMNTLV {
 				info, err := qmi.ParseServingSystemIndication(evt.Packet)
 				if err != nil {
 					m.log.WithError(err).Warn("Failed to parse NAS serving system indication")
 				} else {
+					if hasPLMNTLV && info.MCC == 0 && info.MNC == 0 {
+						// 过滤基带偶发的无效 PLMN，防止缓存被冲刷
+						hasPLMNTLV = false
+					}
 					current, _ := m.snapshot.ServingSystem()
 					previousServing = current
+
+					isChanged := false
 					if current != nil {
+						if hasServingTLV {
+							if info.RegistrationState != current.RegistrationState {
+								isReg1 := info.RegistrationState == qmi.RegStateRegistered || info.RegistrationState == qmi.RegStateRoaming
+								isReg2 := current.RegistrationState == qmi.RegStateRegistered || current.RegistrationState == qmi.RegStateRoaming
+								if !(isReg1 && isReg2) {
+									isChanged = true
+								}
+							}
+							if info.PSAttached != current.PSAttached ||
+								info.RadioInterface != current.RadioInterface {
+								isChanged = true
+							}
+							if !hasPLMNTLV {
+								info.MCC = current.MCC
+								info.MNC = current.MNC
+							}
+						}
+						if hasPLMNTLV {
+							// 过滤基带偶尔抽风上报的无效(全0) PLMN，避免误判和冲刷掉真实缓存
+							if (info.MCC != 0 || info.MNC != 0) && (info.MCC != current.MCC || info.MNC != current.MNC) {
+								isChanged = true
+							}
+							if !hasServingTLV {
+								info.RegistrationState = current.RegistrationState
+								info.PSAttached = current.PSAttached
+								info.RadioInterface = current.RadioInterface
+							}
+						}
+					} else {
+						isChanged = true
 						if !hasServingTLV {
-							// 仅 PLMN 更新场景：保留已知注册态/RAT 信息。
-							info.RegistrationState = current.RegistrationState
-							info.PSAttached = current.PSAttached
-							info.RadioInterface = current.RadioInterface
+							info.RegistrationState = qmi.RegStateUnknown
 						}
-						if !hasPLMNTLV {
-							// 仅 Serving 更新场景：保留已知 PLMN。
-							info.MCC = current.MCC
-							info.MNC = current.MNC
-						}
-					} else if !hasServingTLV {
-						info.RegistrationState = qmi.RegStateUnknown
 					}
+
+					if !isChanged {
+						return
+					}
+
+					m.log.Debugf("NAS serving indication TLVs: has_0x01=%v has_0x12=%v", hasServingTLV, hasPLMNTLV)
 					event.ServingSystem = info
 					switch {
 					case hasServingTLV && hasPLMNTLV:
@@ -4194,6 +4336,8 @@ func shouldLogRawIndication(evt qmi.Event) bool {
 		return false
 	case qmi.EventNASEventReport:
 		return !isEmptyNASEventReport(evt)
+	case qmi.EventServingSystemChanged, qmi.EventNASSignalInfoChanged:
+		return false
 	default:
 		return true
 	}

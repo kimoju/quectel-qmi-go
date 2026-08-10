@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
+	"github.com/kimoju/quectel-qmi-go/pkg/qmi"
 )
 
 type serviceTimeoutKey struct {
@@ -22,6 +22,10 @@ type serviceTimeoutWindow struct {
 
 func shouldRecoverServiceError(service string, err error, serviceUnavailableText string) bool {
 	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, qmi.ErrServiceNotSupported) {
 		return false
 	}
 
@@ -123,6 +127,9 @@ func (m *Manager) recordServiceTimeoutFailure(service string, op string, err err
 		WithField("timeout_count", state.count).
 		WithField("timeout_threshold", threshold).
 		WithField("timeout_window_ms", window.Milliseconds())
+
+	m.detectTimeoutStorm(key.service)
+
 	if reached {
 		if firstReached {
 			m.serviceTimeoutRecoveries.Add(1)
@@ -134,6 +141,37 @@ func (m *Manager) recordServiceTimeoutFailure(service string, op string, err err
 	}
 	entry.WithError(err).Debug("Service operation timeout observed below recovery threshold")
 	return false
+}
+
+func (m *Manager) detectTimeoutStorm(service string) {
+	const stormWindow = 5 * time.Second
+	const stormMinSvcs = 2
+	const stormCooldown = 30 * time.Second
+
+	m.globalTimeoutMu.Lock()
+	defer m.globalTimeoutMu.Unlock()
+
+	now := time.Now()
+	if m.globalTimeoutServices == nil {
+		m.globalTimeoutServices = make(map[string]time.Time)
+	}
+
+	for svc, t := range m.globalTimeoutServices {
+		if now.Sub(t) > stormWindow {
+			delete(m.globalTimeoutServices, svc)
+		}
+	}
+	m.globalTimeoutServices[service] = now
+
+	if len(m.globalTimeoutServices) >= stormMinSvcs {
+		if m.globalTimeoutStormAt.IsZero() || now.Sub(m.globalTimeoutStormAt) > stormCooldown {
+			m.globalTimeoutStormAt = now
+			m.globalTimeoutServices = make(map[string]time.Time)
+			m.log.Warn("Timeout storm detected; triggering immediate core recovery",
+				"services_affected", len(m.globalTimeoutServices))
+			m.enqueueModemResetEvent("timeout_storm")
+		}
+	}
 }
 
 func (m *Manager) noteServiceOperationSuccess(service string, op string) {
@@ -167,9 +205,9 @@ func (m *Manager) logServiceRecovery(service string, op string, phase string, er
 	entry.WithError(err).Warn(message)
 }
 
-func (m *Manager) triggerCoreRecoveryFromService(service string, op string, phase string, cause error) {
+func (m *Manager) triggerCoreRecoveryFromService(service string, op string, phase string, cause error) bool {
 	if m == nil {
-		return
+		return false
 	}
 
 	m.mu.RLock()
@@ -177,7 +215,7 @@ func (m *Manager) triggerCoreRecoveryFromService(service string, op string, phas
 	stopping := m.state == StateStopping
 	m.mu.RUnlock()
 	if !coreReady || stopping {
-		return
+		return false
 	}
 
 	cooldown := m.uimRecoverCooldown
@@ -194,13 +232,41 @@ func (m *Manager) triggerCoreRecoveryFromService(service string, op string, phas
 			WithField("op", op).
 			WithField("phase", phase).
 			Debug("Skip core recovery trigger due to cooldown")
-		return
+		return false
 	}
 	m.uimLastRecoverSignal = now
 	m.uimRecoveryMu.Unlock()
 
 	m.logServiceRecovery(service, op, "recover-core", cause, "Scheduling core recovery due to service failure")
 	m.enqueueModemResetEvent(strings.ToLower(service) + "_recovery")
+	return true
+}
+
+// RequestCoreRecovery asks the manager to run the same core recovery path used
+// for modem reset/service-failure handling. It is intended for higher-level
+// flows that have already classified a service stall, such as post-eSIM-switch
+// convergence.
+func (m *Manager) RequestCoreRecovery(reason string) bool {
+	if m == nil {
+		return false
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "external_request"
+	}
+
+	m.mu.RLock()
+	coreReady := m.coreReady
+	stopping := m.state == StateStopping
+	m.mu.RUnlock()
+	if !coreReady || stopping {
+		return false
+	}
+
+	cause := fmt.Errorf("%s", reason)
+	m.logServiceRecovery("POST_SWITCH", reason, "recover-core", cause, "Scheduling core recovery due to explicit request")
+	m.enqueueModemResetEvent("post_switch_recovery")
+	return true
 }
 
 func (m *Manager) maybeReplayWMSStateAfterRebind(reason string) {
@@ -270,7 +336,8 @@ func withDMSRecoveryValue[T any](m *Manager, op string, fn func(dms *qmi.DMSServ
 		return retryResult, nil
 	}
 	if m.shouldRecoverDMSError(op, retryErr) {
-		m.logServiceRecovery("DMS", op, "retry", retryErr, "DMS operation still failing after rebind (core recovery skipped)")
+		m.logServiceRecovery("DMS", op, "retry", retryErr, "DMS operation still failing after rebind; escalating to core recovery")
+		m.triggerCoreRecoveryFromService("DMS", op, "retry", retryErr)
 	}
 	return retryResult, retryErr
 }

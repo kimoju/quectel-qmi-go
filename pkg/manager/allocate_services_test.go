@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
+	"github.com/kimoju/quectel-qmi-go/pkg/qmi"
 )
 
 func TestAllocateServicesUsesCallerContextForClientIDAllocation(t *testing.T) {
@@ -188,11 +188,14 @@ func TestAllocateServicesReturnsErrorWhenCoreServiceAllocationFails(t *testing.T
 			m.registerUIMIndications = func(context.Context) (uint32, error) {
 				return 0, nil
 			}
-			coreErr := fmt.Errorf("%s unavailable", tt.name)
+			coreErr := qmi.ErrServiceNotSupported
 			tt.hook(m, coreErr)
 			err := m.allocateServices(context.Background())
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("allocateServices() error=%v, want %q", err, tt.want)
+			}
+			if !errors.Is(err, qmi.ErrServiceNotSupported) {
+				t.Fatalf("allocateServices() error=%v, want to wrap ErrServiceNotSupported", err)
 			}
 		})
 	}

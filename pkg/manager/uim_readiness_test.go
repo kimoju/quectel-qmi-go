@@ -8,7 +8,7 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
+	"github.com/kimoju/quectel-qmi-go/pkg/qmi"
 )
 
 func TestBuildUIMReadinessReadyWithActiveSlotAndIdentity(t *testing.T) {
@@ -295,4 +295,36 @@ func setUnexportedField(t *testing.T, field reflect.Value, value reflect.Value) 
 func getUnexportedField(t *testing.T, field reflect.Value) reflect.Value {
 	t.Helper()
 	return reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem()
+}
+
+func TestBuildUIMReadinessDetectedNeedsProvisioning(t *testing.T) {
+	details := &qmi.CardStatusDetails{CardState: 0x01, AppState: qmi.UIMAppStateDetected}
+	// 裸系统典型：PIN 已校验 → status 可能算成 SIMReady，但应用仍 detected。
+	r := buildUIMReadiness(qmi.SIMReady, details, nil, DeviceIdentities{ICCID: "89860"}, nil)
+	if !r.NeedsProvisioning {
+		t.Fatalf("expected NeedsProvisioning=true, got readiness=%+v", r)
+	}
+	if r.Reason != UIMReadinessNeedsProvisioning {
+		t.Fatalf("expected reason=%q, got %q", UIMReadinessNeedsProvisioning, r.Reason)
+	}
+	if r.UIMReady {
+		t.Fatalf("detected app must not be reported UIMReady")
+	}
+	if r.AppState != qmi.UIMAppStateDetected {
+		t.Fatalf("expected AppState=%d, got %d", qmi.UIMAppStateDetected, r.AppState)
+	}
+}
+
+func TestBuildUIMReadinessReadyAppIsProvisioned(t *testing.T) {
+	details := &qmi.CardStatusDetails{CardState: 0x01, AppState: qmi.UIMAppStateReady}
+	r := buildUIMReadiness(qmi.SIMReady, details, nil, DeviceIdentities{ICCID: "89860"}, nil)
+	if r.NeedsProvisioning {
+		t.Fatalf("ready app must not need provisioning: %+v", r)
+	}
+	if !r.ProvisioningActive {
+		t.Fatalf("ready app must report ProvisioningActive=true")
+	}
+	if !r.UIMReady || r.Reason != UIMReadinessReady {
+		t.Fatalf("ready app must be UIMReady/Ready, got %+v", r)
+	}
 }

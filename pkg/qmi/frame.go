@@ -133,8 +133,9 @@ const (
 	CTLGetVersionInfo    uint16 = 0x0021 // QMICTL_GET_VERSION_REQ
 	CTLGetClientID       uint16 = 0x0022 // QMICTL_GET_CLIENT_ID_REQ
 	CTLReleaseClientID   uint16 = 0x0023 // QMICTL_RELEASE_CLIENT_ID_REQ
-	CTLSetDataFormat     uint16 = 0x0026 // QMICTL_SET_DATA_FORMAT_REQ
 	CTLRevokeClientIDInd uint16 = 0x0024 // QMICTL_REVOKE_CLIENT_ID_IND
+	CTLSetDataFormat     uint16 = 0x0026 // QMICTL_SET_DATA_FORMAT_REQ
+	CTLSync              uint16 = 0x0027 // QMICTL_SYNC_REQ
 	CTLInternalProxyOpen uint16 = 0xFF00 // libqmi qmi-proxy internal open request
 	TLVProxyDevicePath   uint8  = 0x01   // CTLInternalProxyOpen device path TLV
 )

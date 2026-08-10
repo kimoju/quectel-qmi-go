@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/iniwex5/quectel-qmi-go/pkg/qmi"
+	"github.com/kimoju/quectel-qmi-go/pkg/qmi"
 )
 
 func (m *Manager) withUIMRecovery(op string, fn func(uim *qmi.UIMService) error) error {

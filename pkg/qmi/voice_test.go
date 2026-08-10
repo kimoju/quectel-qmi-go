@@ -428,3 +428,14 @@ func TestDispatchVoiceIndications(t *testing.T) {
 		}
 	}
 }
+
+func TestNewVOICEService_Unsupported(t *testing.T) {
+	client := &Client{}
+	client.versionQueried = true
+	client.serviceVersions = map[uint8]ServiceVersion{}
+
+	_, err := NewVOICEService(client)
+	if err != ErrServiceNotSupported {
+		t.Fatalf("expected ErrServiceNotSupported, got %v", err)
+	}
+}

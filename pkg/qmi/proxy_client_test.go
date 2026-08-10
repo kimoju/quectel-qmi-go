@@ -120,6 +120,84 @@ func TestClientProxyAllocateClientIDAfterOpen(t *testing.T) {
 	}
 }
 
+func TestAllocateClientIDWithContextUnsupportedServiceReturnsErrServiceNotSupported(t *testing.T) {
+	client := &Client{
+		transactions:    make(map[uint32]*transactionEntry),
+		writeCh:         make(chan writeRequest),
+		closeCh:         make(chan struct{}),
+		versionQueried:  true,
+		serviceVersions: map[uint8]ServiceVersion{},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	_, err := client.AllocateClientIDWithContext(ctx, ServiceWMS)
+	if !errors.Is(err, ErrServiceNotSupported) {
+		t.Fatalf("AllocateClientIDWithContext() error=%v, want ErrServiceNotSupported", err)
+	}
+}
+
+func TestAllocateClientIDWithContextUnknownServiceCacheFallsThrough(t *testing.T) {
+	const devicePath = "/dev/cdc-wdm-unknown-cache"
+	const clientID = 0x44
+
+	errCh := withProxyTransportForTest(t, func(conn net.Conn) error {
+		defer conn.Close()
+
+		openReq, err := readQMIFrameFromConn(conn)
+		if err != nil {
+			return err
+		}
+		if err := assertCTLRequest(openReq, CTLInternalProxyOpen); err != nil {
+			return err
+		}
+		if err := writeCTLSuccess(conn, openReq); err != nil {
+			return err
+		}
+
+		allocReq, err := readQMIFrameFromConn(conn)
+		if err != nil {
+			return err
+		}
+		if err := assertCTLRequest(allocReq, CTLGetClientID); err != nil {
+			return err
+		}
+		tlv := FindTLV(allocReq.TLVs, 0x01)
+		if tlv == nil || len(tlv.Value) != 1 || tlv.Value[0] != ServiceWMS {
+			return fmt.Errorf("allocate client ID TLV = %#v, want service WMS", tlv)
+		}
+		return writeCTLResponse(conn, allocReq, []TLV{
+			successTLV(),
+			{Type: 0x01, Value: []byte{ServiceWMS, clientID}},
+		})
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	client, err := NewClientWithOptions(ctx, devicePath, ClientOptions{
+		UseProxy:     true,
+		SyncOnOpen:   false,
+		ReadDeadline: 5 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewClientWithOptions() error = %v", err)
+	}
+	defer client.Close()
+
+	got, err := client.AllocateClientIDWithContext(ctx, ServiceWMS)
+	if err != nil {
+		t.Fatalf("AllocateClientIDWithContext() error = %v", err)
+	}
+	if got != clientID {
+		t.Fatalf("client ID = 0x%02x, want 0x%02x", got, clientID)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestClientFallsBackToRawWhenProxyTransportOpenFails(t *testing.T) {
 	const devicePath = "/dev/cdc-wdm-fallback0"
 
