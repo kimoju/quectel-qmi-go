@@ -375,7 +375,9 @@ func (m *Manager) ensureDMSService() (*qmi.DMSService, error) {
 		return nil, ErrServiceNotReady("DMS")
 	}
 
-	allocated, err := qmi.NewDMSService(client)
+	allocCtx, cancel := m.opContext(m.cfg.Timeouts.Init)
+	allocated, err := m.createDMSServiceWithClient(allocCtx, client)
+	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("allocate DMS client failed: %w", err)
 	}
@@ -414,7 +416,9 @@ func (m *Manager) rebindDMSService(reason string) (*qmi.DMSService, error) {
 		return nil, ErrServiceNotReady("DMS")
 	}
 
-	allocated, err := qmi.NewDMSService(client)
+	allocCtx, cancel := m.opContext(m.cfg.Timeouts.Init)
+	allocated, err := m.createDMSServiceWithClient(allocCtx, client)
+	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("allocate DMS client failed: %w", err)
 	}
@@ -518,18 +522,23 @@ func (m *Manager) ensureNASService() (*qmi.NASService, error) {
 		return nil, ErrServiceNotReady("NAS")
 	}
 
-	allocated, err := qmi.NewNASService(client)
+	allocCtx, cancel := m.opContext(m.cfg.Timeouts.Init)
+	allocated, err := m.createNASServiceWithClient(allocCtx, client)
+	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("allocate NAS client failed: %w", err)
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.client != client {
+		m.mu.Unlock()
 		_ = allocated.Close()
 		return nil, ErrServiceNotReady("NAS")
 	}
 	m.nas = allocated
+	m.mu.Unlock()
+
+	m.replayNASIndications("lazy_alloc", allocated)
 	m.log.Info("NAS service lazily allocated")
 	return allocated, nil
 }
@@ -539,7 +548,11 @@ func (m *Manager) rebindNASService(reason string) (*qmi.NASService, error) {
 		return nil, ErrServiceNotReady("NAS")
 	}
 	if m.rebindNASServiceHook != nil {
-		return m.rebindNASServiceHook(reason)
+		rebound, err := m.rebindNASServiceHook(reason)
+		if err == nil && rebound != nil && m.registerNASIndications != nil {
+			m.replayNASIndications(reason, rebound)
+		}
+		return rebound, err
 	}
 
 	m.mu.Lock()
@@ -557,18 +570,23 @@ func (m *Manager) rebindNASService(reason string) (*qmi.NASService, error) {
 		return nil, ErrServiceNotReady("NAS")
 	}
 
-	allocated, err := qmi.NewNASService(client)
+	allocCtx, cancel := m.opContext(m.cfg.Timeouts.Init)
+	allocated, err := m.createNASServiceWithClient(allocCtx, client)
+	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("allocate NAS client failed: %w", err)
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.client != client {
+		m.mu.Unlock()
 		_ = allocated.Close()
 		return nil, ErrServiceNotReady("NAS")
 	}
 	m.nas = allocated
+	m.mu.Unlock()
+
+	m.replayNASIndications(reason, allocated)
 	m.log.WithField("reason", reason).Info("NAS service rebound")
 	return allocated, nil
 }
@@ -606,9 +624,7 @@ func withWMSRecoveryValue[T any](m *Manager, op string, fn func(wms *qmi.WMSServ
 
 	m.logServiceRecovery("WMS", op, "initial", err, "WMS operation failed; rebinding WMS service")
 
-	m.wmsRecoveryMu.Lock()
 	wms, rebindErr := m.rebindWMSService("recover:" + op)
-	m.wmsRecoveryMu.Unlock()
 	if rebindErr != nil {
 		m.logServiceRecovery("WMS", op, "rebind", rebindErr, "WMS service rebind failed (core recovery skipped)")
 		return zero, fmt.Errorf("%s: WMS rebind failed: %w (initial=%v)", op, rebindErr, err)
@@ -646,32 +662,40 @@ func (m *Manager) ensureWMSService() (*qmi.WMSService, error) {
 	}
 
 	m.wmsRecoveryMu.Lock()
-	defer m.wmsRecoveryMu.Unlock()
-
 	m.mu.RLock()
 	wms = m.wms
 	client = m.client
 	m.mu.RUnlock()
 	if wms != nil {
+		m.wmsRecoveryMu.Unlock()
 		return wms, nil
 	}
 	if client == nil {
+		m.wmsRecoveryMu.Unlock()
 		return nil, ErrServiceNotReady("WMS")
 	}
 
-	allocated, err := qmi.NewWMSService(client)
+	allocCtx, cancel := m.opContext(m.cfg.Timeouts.Init)
+	allocated, err := m.createWMSServiceWithClient(allocCtx, client)
+	cancel()
 	if err != nil {
+		m.wmsRecoveryMu.Unlock()
 		return nil, fmt.Errorf("allocate WMS client failed: %w", err)
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.client != client {
+		m.mu.Unlock()
+		m.wmsRecoveryMu.Unlock()
 		_ = allocated.Close()
 		return nil, ErrServiceNotReady("WMS")
 	}
 	m.wms = allocated
+	m.mu.Unlock()
+	m.wmsRecoveryMu.Unlock()
+
 	m.log.Info("WMS service lazily allocated")
+	m.maybeReplayWMSStateAfterRebind("lazy_alloc")
 	return allocated, nil
 }
 
@@ -679,8 +703,10 @@ func (m *Manager) rebindWMSService(reason string) (*qmi.WMSService, error) {
 	if m == nil {
 		return nil, ErrServiceNotReady("WMS")
 	}
+	m.wmsRecoveryMu.Lock()
 	if m.rebindWMSServiceHook != nil {
 		rebound, err := m.rebindWMSServiceHook(reason)
+		m.wmsRecoveryMu.Unlock()
 		if err == nil && rebound != nil {
 			m.maybeReplayWMSStateAfterRebind(reason)
 		}
@@ -699,22 +725,28 @@ func (m *Manager) rebindWMSService(reason string) (*qmi.WMSService, error) {
 		}
 	}
 	if client == nil {
+		m.wmsRecoveryMu.Unlock()
 		return nil, ErrServiceNotReady("WMS")
 	}
 
-	allocated, err := qmi.NewWMSService(client)
+	allocCtx, cancel := m.opContext(m.cfg.Timeouts.Init)
+	allocated, err := m.createWMSServiceWithClient(allocCtx, client)
+	cancel()
 	if err != nil {
+		m.wmsRecoveryMu.Unlock()
 		return nil, fmt.Errorf("allocate WMS client failed: %w", err)
 	}
 
 	m.mu.Lock()
 	if m.client != client {
 		m.mu.Unlock()
+		m.wmsRecoveryMu.Unlock()
 		_ = allocated.Close()
 		return nil, ErrServiceNotReady("WMS")
 	}
 	m.wms = allocated
 	m.mu.Unlock()
+	m.wmsRecoveryMu.Unlock()
 
 	m.log.WithField("reason", reason).Info("WMS service rebound")
 	m.maybeReplayWMSStateAfterRebind(reason)
@@ -807,18 +839,23 @@ func (m *Manager) ensureVOICEService() (*qmi.VOICEService, error) {
 		return nil, ErrServiceNotReady("VOICE")
 	}
 
-	allocated, err := qmi.NewVOICEService(client)
+	allocCtx, cancel := m.opContext(m.cfg.Timeouts.Init)
+	allocated, err := m.createVOICEServiceWithClient(allocCtx, client)
+	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("allocate VOICE client failed: %w", err)
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.client != client {
+		m.mu.Unlock()
 		_ = allocated.Close()
 		return nil, ErrServiceNotReady("VOICE")
 	}
 	m.voice = allocated
+	m.mu.Unlock()
+
+	m.replayVOICEIndications("lazy_alloc", allocated)
 	m.log.Info("VOICE service lazily allocated")
 	return allocated, nil
 }
@@ -828,7 +865,11 @@ func (m *Manager) rebindVOICEService(reason string) (*qmi.VOICEService, error) {
 		return nil, ErrServiceNotReady("VOICE")
 	}
 	if m.rebindVOICEServiceHook != nil {
-		return m.rebindVOICEServiceHook(reason)
+		rebound, err := m.rebindVOICEServiceHook(reason)
+		if err == nil && rebound != nil && m.registerVOICEIndications != nil {
+			m.replayVOICEIndications(reason, rebound)
+		}
+		return rebound, err
 	}
 
 	m.mu.Lock()
@@ -846,18 +887,23 @@ func (m *Manager) rebindVOICEService(reason string) (*qmi.VOICEService, error) {
 		return nil, ErrServiceNotReady("VOICE")
 	}
 
-	allocated, err := qmi.NewVOICEService(client)
+	allocCtx, cancel := m.opContext(m.cfg.Timeouts.Init)
+	allocated, err := m.createVOICEServiceWithClient(allocCtx, client)
+	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("allocate VOICE client failed: %w", err)
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.client != client {
+		m.mu.Unlock()
 		_ = allocated.Close()
 		return nil, ErrServiceNotReady("VOICE")
 	}
 	m.voice = allocated
+	m.mu.Unlock()
+
+	m.replayVOICEIndications(reason, allocated)
 	m.log.WithField("reason", reason).Info("VOICE service rebound")
 	return allocated, nil
 }

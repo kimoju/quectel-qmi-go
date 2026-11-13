@@ -128,6 +128,8 @@ type CardStatusDetails struct {
 	CardState           uint8
 	ErrorCode           uint8
 	NumSlot             uint8
+	ActiveSlot          uint8
+	PrimaryGWSlot       uint8
 	NumApp              uint8
 	AppType             uint8
 	AppState            uint8
@@ -146,6 +148,17 @@ type CardStatusDetails struct {
 	UPINState           PINStatus
 	UPINRetries         uint8
 	UPUKRetries         uint8
+}
+
+type uimCardStatusCard struct {
+	slot        uint8
+	cardState   uint8
+	upinState   PINStatus
+	upinRetries uint8
+	upukRetries uint8
+	errorCode   uint8
+	numApp      uint8
+	apps        []uimCardStatusApp
 }
 
 type uimCardStatusApp struct {
@@ -315,6 +328,91 @@ func (u *UIMService) Close() error {
 	return u.client.ReleaseClientID(ServiceUIM, u.clientID)
 }
 
+type parsedUIMCardStatus struct {
+	indexGWPri    uint16
+	primaryGWSlot uint8
+	primaryGWApp  int
+	numSlot       uint8
+	cards         []uimCardStatusCard
+}
+
+func parseUIMCardStatusTLV(v []byte) (*parsedUIMCardStatus, error) {
+	if len(v) < 15 {
+		return nil, fmt.Errorf("card status TLV missing or too short")
+	}
+
+	indexGWPri := binary.LittleEndian.Uint16(v[0:2])
+	numSlot := v[8]
+	parsed := &parsedUIMCardStatus{
+		indexGWPri:   indexGWPri,
+		primaryGWApp: -1,
+		numSlot:      numSlot,
+	}
+	if indexGWPri != 0xFFFF {
+		slotIdx := uint8(indexGWPri >> 8)
+		appIdx := int(indexGWPri & 0xFF)
+		if numSlot == 0 || slotIdx < numSlot {
+			parsed.primaryGWSlot = slotIdx + 1
+			parsed.primaryGWApp = appIdx
+		}
+	}
+
+	slotCount := int(numSlot)
+	if slotCount <= 0 {
+		slotCount = 1
+	}
+	offset := 9
+	parsed.cards = make([]uimCardStatusCard, 0, slotCount)
+	for s := 0; s < slotCount; s++ {
+		if offset+6 > len(v) {
+			break
+		}
+		card := uimCardStatusCard{
+			slot:        uint8(s + 1),
+			cardState:   v[offset],
+			upinState:   PINStatus(v[offset+1]),
+			upinRetries: v[offset+2],
+			upukRetries: v[offset+3],
+			errorCode:   v[offset+4],
+			numApp:      v[offset+5],
+		}
+		offset += 6
+		apps, nextOffset := parseUIMCardStatusAppsAt(v, offset, card.numApp)
+		card.apps = apps
+		offset = nextOffset
+		parsed.cards = append(parsed.cards, card)
+	}
+	if len(parsed.cards) == 0 {
+		return nil, fmt.Errorf("card status TLV missing card entries")
+	}
+	return parsed, nil
+}
+
+func (p *parsedUIMCardStatus) selectActiveCard() (*uimCardStatusCard, int) {
+	if p == nil || len(p.cards) == 0 {
+		return nil, -1
+	}
+	if p.primaryGWSlot > 0 && int(p.primaryGWSlot) <= len(p.cards) {
+		gwCard := &p.cards[p.primaryGWSlot-1]
+		if gwCard.cardState != 0x00 {
+			return gwCard, p.primaryGWApp
+		}
+		// Only fall back away from primaryGWSlot when another slot actually has a card present.
+		for i := range p.cards {
+			if p.cards[i].cardState != 0x00 {
+				return &p.cards[i], -1
+			}
+		}
+		return gwCard, p.primaryGWApp
+	}
+	for i := range p.cards {
+		if p.cards[i].cardState != 0x00 {
+			return &p.cards[i], -1
+		}
+	}
+	return &p.cards[0], -1
+}
+
 func (u *UIMService) GetCardStatusDetails(ctx context.Context) (*CardStatusDetails, SIMStatus, error) {
 	resp, err := u.client.SendRequest(ctx, ServiceUIM, u.clientID, UIMGetCardStatus, nil)
 	if err != nil {
@@ -326,28 +424,43 @@ func (u *UIMService) GetCardStatusDetails(ctx context.Context) (*CardStatusDetai
 	}
 
 	tlv := FindTLV(resp.TLVs, 0x10)
-	if tlv == nil || len(tlv.Value) < 15 {
+	if tlv == nil {
 		return nil, SIMNotReady, fmt.Errorf("card status TLV missing or too short")
 	}
+	parsed, err := parseUIMCardStatusTLV(tlv.Value)
+	if err != nil {
+		return nil, SIMNotReady, err
+	}
 
-	v := tlv.Value
-	details := &CardStatusDetails{}
-	details.NumSlot = v[8]
-	details.CardState = v[9]
-	details.UPINState = PINStatus(v[10])
-	details.UPINRetries = v[11]
-	details.UPUKRetries = v[12]
-	details.ErrorCode = v[13]
-	details.NumApp = v[14]
+	card, preferredAppIdx := parsed.selectActiveCard()
+	details := &CardStatusDetails{
+		NumSlot:       parsed.numSlot,
+		ActiveSlot:    card.slot,
+		PrimaryGWSlot: parsed.primaryGWSlot,
+		CardState:     card.cardState,
+		UPINState:     card.upinState,
+		UPINRetries:   card.upinRetries,
+		UPUKRetries:   card.upukRetries,
+		ErrorCode:     card.errorCode,
+		NumApp:        card.numApp,
+	}
 
-	apps := parseUIMCardStatusApps(v, details.NumApp)
-
+	apps := card.apps
 	var chosen *uimCardStatusApp
-	for i := range apps {
-		if apps[i].appType == 0x02 {
-			chosen = &apps[i]
-			break
+	if preferredAppIdx >= 0 && preferredAppIdx < len(apps) &&
+		(apps[preferredAppIdx].appType == UIMAppTypeUSIM || apps[preferredAppIdx].appType == UIMAppTypeSIM) {
+		chosen = &apps[preferredAppIdx]
+	}
+	if chosen == nil {
+		for i := range apps {
+			if apps[i].appType == UIMAppTypeUSIM {
+				chosen = &apps[i]
+				break
+			}
 		}
+	}
+	if chosen == nil && preferredAppIdx >= 0 && preferredAppIdx < len(apps) {
+		chosen = &apps[preferredAppIdx]
 	}
 	if chosen == nil && len(apps) > 0 {
 		chosen = &apps[0]
@@ -409,7 +522,11 @@ func (u *UIMService) GetCardStatusDetails(ctx context.Context) (*CardStatusDetai
 }
 
 func parseUIMCardStatusApps(v []byte, numApp uint8) []uimCardStatusApp {
-	offset := 15
+	apps, _ := parseUIMCardStatusAppsAt(v, 15, numApp)
+	return apps
+}
+
+func parseUIMCardStatusAppsAt(v []byte, offset int, numApp uint8) ([]uimCardStatusApp, int) {
 	apps := make([]uimCardStatusApp, 0, int(numApp))
 	for i := 0; i < int(numApp); i++ {
 		if offset+7 > len(v) {
@@ -448,7 +565,7 @@ func parseUIMCardStatusApps(v []byte, numApp uint8) []uimCardStatusApp {
 		offset += 7
 		apps = append(apps, app)
 	}
-	return apps
+	return apps, offset
 }
 
 // GetCardStatus queries the UIM card status / GetCardStatus查询UIM卡状态
@@ -474,18 +591,37 @@ func (u *UIMService) getCardStatusAID(ctx context.Context, appType uint8, prefix
 		return nil, fmt.Errorf("UIM get card status failed: %w", err)
 	}
 	tlv := FindTLV(resp.TLVs, 0x10)
-	if tlv == nil || len(tlv.Value) < 15 {
+	if tlv == nil {
 		return nil, fmt.Errorf("card status TLV missing or too short")
 	}
-	apps := parseUIMCardStatusApps(tlv.Value, tlv.Value[14])
-	for _, app := range apps {
-		if app.appType != appType {
+	parsed, err := parseUIMCardStatusTLV(tlv.Value)
+	if err != nil {
+		return nil, err
+	}
+	activeCard, _ := parsed.selectActiveCard()
+	candidates := make([]*uimCardStatusCard, 0, len(parsed.cards))
+	if activeCard != nil {
+		candidates = append(candidates, activeCard)
+	}
+	for i := range parsed.cards {
+		c := &parsed.cards[i]
+		if activeCard != nil && c.slot == activeCard.slot {
 			continue
 		}
-		if len(app.aid) < len(prefix) || !bytes.Equal(app.aid[:len(prefix)], prefix) {
-			return nil, fmt.Errorf("UIM %s AID invalid: %X", label, app.aid)
+		if c.cardState != 0x00 {
+			candidates = append(candidates, c)
 		}
-		return append([]byte(nil), app.aid...), nil
+	}
+	for _, card := range candidates {
+		for _, app := range card.apps {
+			if app.appType != appType {
+				continue
+			}
+			if len(app.aid) < len(prefix) || !bytes.Equal(app.aid[:len(prefix)], prefix) {
+				return nil, fmt.Errorf("UIM %s AID invalid: %X", label, app.aid)
+			}
+			return append([]byte(nil), app.aid...), nil
+		}
 	}
 	return nil, fmt.Errorf("UIM %s application not found: app_type=0x%02x", label, appType)
 }
@@ -1289,10 +1425,35 @@ func (u *UIMService) ReadTransparentWithSession(ctx context.Context, sessionType
 	return nil, nil
 }
 
+func cardSessionTypeForSlot(slot uint8) uint8 {
+	switch slot {
+	case 2:
+		return UIMSessionTypeCardSlot2
+	case 3:
+		return UIMSessionTypeCardSlot3
+	default:
+		return UIMSessionTypeCardSlot1
+	}
+}
+
+func (u *UIMService) resolveActiveCardSessionType(ctx context.Context) uint8 {
+	details, _, err := u.GetCardStatusDetails(ctx)
+	if err == nil && details != nil {
+		if details.PrimaryGWSlot > 0 {
+			return cardSessionTypeForSlot(details.PrimaryGWSlot)
+		}
+		if details.ActiveSlot > 0 {
+			return cardSessionTypeForSlot(details.ActiveSlot)
+		}
+	}
+	return UIMSessionTypeCardSlot1
+}
+
 func (u *UIMService) GetICCID(ctx context.Context) (string, error) {
-	data, err := u.ReadTransparentWithSession(ctx, 0x06, 0x2FE2, []byte{0x00, 0x3F})
+	sessionType := u.resolveActiveCardSessionType(ctx)
+	data, err := u.ReadTransparentWithSession(ctx, sessionType, 0x2FE2, []byte{0x00, 0x3F})
 	if err != nil {
-		data, err = u.ReadTransparentWithSession(ctx, 0x06, 0x2FE2, []byte{})
+		data, err = u.ReadTransparentWithSession(ctx, sessionType, 0x2FE2, []byte{})
 		if err != nil {
 			return "", err
 		}

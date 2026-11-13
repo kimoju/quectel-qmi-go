@@ -172,12 +172,14 @@ type EventHandler func(event Event)
 
 // EventEmitter manages event handlers / EventEmitter 管理事件处理器
 type EventEmitter struct {
-	mu        sync.RWMutex
-	handlers  []EventHandler
-	queue     chan Event
-	done      chan struct{}
-	closeOnce sync.Once
-	dropped   atomic.Uint64
+	mu       sync.RWMutex
+	handlers []EventHandler
+	queue    chan Event
+	done     chan struct{}
+	closed   bool
+	started  bool
+	lazy     bool
+	dropped  atomic.Uint64
 }
 
 // NewEventEmitter creates a new event emitter / NewEventEmitter 创建新的事件发射器
@@ -189,13 +191,12 @@ func NewEventEmitterWithQueueSize(size int) *EventEmitter {
 	if size <= 0 {
 		size = 128
 	}
-	e := &EventEmitter{
+	return &EventEmitter{
 		handlers: make([]EventHandler, 0),
 		queue:    make(chan Event, size),
 		done:     make(chan struct{}),
+		lazy:     true,
 	}
-	go e.loop()
-	return e
 }
 
 func cloneBytes(in []byte) []byte {
@@ -493,12 +494,12 @@ func cloneEvent(event Event) Event {
 	return out
 }
 
-func (e *EventEmitter) loop() {
+func (e *EventEmitter) loop(done <-chan struct{}, queue <-chan Event) {
 	for {
 		select {
-		case <-e.done:
+		case <-done:
 			return
-		case event := <-e.queue:
+		case event := <-queue:
 			e.mu.RLock()
 			handlers := make([]EventHandler, len(e.handlers))
 			copy(handlers, e.handlers)
@@ -518,11 +519,63 @@ func (e *EventEmitter) loop() {
 	}
 }
 
-// On registers an event handler / On 注册事件处理器
-func (e *EventEmitter) On(handler EventHandler) {
+func (e *EventEmitter) ensureLoopLocked() {
+	if e == nil || !e.lazy || e.started || e.closed || e.done == nil || e.queue == nil {
+		return
+	}
+	select {
+	case <-e.done:
+		e.closed = true
+		return
+	default:
+	}
+	e.started = true
+	go e.loop(e.done, e.queue)
+}
+
+// reopen resets a closed EventEmitter so a stopped Manager can emit events again if restarted.
+func (e *EventEmitter) reopen(defaultSize int) {
+	if e == nil {
+		return
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	closed := e.closed
+	if !closed && e.done != nil {
+		select {
+		case <-e.done:
+			closed = true
+		default:
+		}
+	}
+	if !closed && e.done != nil && e.queue != nil {
+		return
+	}
+	size := cap(e.queue)
+	if size <= 0 {
+		if defaultSize <= 0 {
+			defaultSize = 128
+		}
+		size = defaultSize
+	}
+	e.queue = make(chan Event, size)
+	e.done = make(chan struct{})
+	e.closed = false
+	e.started = false
+	e.lazy = true
+}
+
+// On registers an event handler / On 注册事件处理器
+func (e *EventEmitter) On(handler EventHandler) {
+	if e == nil || handler == nil {
+		return
+	}
+	e.mu.Lock()
 	e.handlers = append(e.handlers, handler)
+	if len(e.queue) > 0 {
+		e.ensureLoopLocked()
+	}
+	e.mu.Unlock()
 }
 
 // Emit sends an event to all handlers / Emit 向所有处理器发送事件
@@ -530,17 +583,50 @@ func (e *EventEmitter) Emit(event Event) bool {
 	if e == nil {
 		return false
 	}
-	select {
-	case <-e.done:
+	e.mu.RLock()
+	closed := e.closed
+	done := e.done
+	queue := e.queue
+	hasHandlers := len(e.handlers) > 0
+	needStart := e.lazy && hasHandlers && !e.started && !closed
+	lazyNoHandlers := e.lazy && !hasHandlers
+	e.mu.RUnlock()
+
+	if closed {
 		e.dropped.Add(1)
 		return false
-	default:
 	}
+	if done != nil {
+		select {
+		case <-done:
+			e.dropped.Add(1)
+			return false
+		default:
+		}
+	}
+	// When created via NewEventEmitter* and no handlers are registered, do not spawn a worker
+	// or accumulate stale events in the bounded channel.
+	if lazyNoHandlers {
+		return true
+	}
+	if needStart {
+		e.mu.Lock()
+		if e.closed {
+			e.mu.Unlock()
+			e.dropped.Add(1)
+			return false
+		}
+		e.ensureLoopLocked()
+		done = e.done
+		queue = e.queue
+		e.mu.Unlock()
+	}
+
 	select {
-	case <-e.done:
+	case <-done:
 		e.dropped.Add(1)
 		return false
-	case e.queue <- event:
+	case queue <- event:
 		return true
 	default:
 		e.dropped.Add(1)
@@ -549,12 +635,22 @@ func (e *EventEmitter) Emit(event Event) bool {
 }
 
 func (e *EventEmitter) Close() {
-	if e == nil || e.done == nil {
+	if e == nil {
 		return
 	}
-	e.closeOnce.Do(func() {
-		close(e.done)
-	})
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return
+	}
+	e.closed = true
+	if e.done != nil {
+		select {
+		case <-e.done:
+		default:
+			close(e.done)
+		}
+	}
 }
 
 func (e *EventEmitter) Dropped() uint64 {

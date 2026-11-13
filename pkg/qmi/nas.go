@@ -1079,8 +1079,62 @@ func parseOperatorNamePacket(packet *Packet, checkResult bool) (*NASOperatorName
 	return info, nil
 }
 
+func formatNetworkScanMNC(mnc uint16, includesPCSDigit bool) string {
+	if includesPCSDigit || mnc > 99 {
+		return fmt.Sprintf("%03d", mnc)
+	}
+	return fmt.Sprintf("%02d", mnc)
+}
+
+func parseNetworkScanPCSMap(packet *Packet) map[[2]uint16]bool {
+	pcsMap := make(map[[2]uint16]bool)
+	if packet == nil {
+		return pcsMap
+	}
+
+	// In QMI_NAS_PERFORM_NETWORK_SCAN_RESP (0x0021), TLV 0x12 is MNC PCS Digit Include Status.
+	// In QMI_NAS_INCREMENTAL_NETWORK_SCAN_IND (0x0085), TLV 0x12 is 1-byte Scan Status and TLV 0x13 is MNC PCS Digit Include Status.
+	var pcsTLV *TLV
+	if packet.MessageID == NASIncrementalNetworkScanInd {
+		pcsTLV = FindTLV(packet.TLVs, 0x13)
+	} else {
+		if cand := FindTLV(packet.TLVs, 0x12); cand != nil && len(cand.Value) >= 2 {
+			count := int(binary.LittleEndian.Uint16(cand.Value[0:2]))
+			if len(cand.Value) >= 2+count*5 {
+				pcsTLV = cand
+			}
+		}
+		if pcsTLV == nil {
+			pcsTLV = FindTLV(packet.TLVs, 0x13)
+		}
+	}
+	if pcsTLV == nil || len(pcsTLV.Value) < 2 {
+		return pcsMap
+	}
+
+	n := int(binary.LittleEndian.Uint16(pcsTLV.Value[0:2]))
+	offset := 2
+	for i := 0; i < n; i++ {
+		if len(pcsTLV.Value)-offset < 5 {
+			break
+		}
+		mcc := binary.LittleEndian.Uint16(pcsTLV.Value[offset : offset+2])
+		mnc := binary.LittleEndian.Uint16(pcsTLV.Value[offset+2 : offset+4])
+		includesPCS := pcsTLV.Value[offset+4] != 0
+		offset += 5
+		pcsMap[[2]uint16{mcc, mnc}] = includesPCS
+	}
+	return pcsMap
+}
+
 func parseNetworkScanResults(packet *Packet) []NetworkScanResult {
 	var results []NetworkScanResult
+	type rawPLMN struct {
+		mcc uint16
+		mnc uint16
+	}
+	var rawPLMNs []rawPLMN
+	pcsMap := parseNetworkScanPCSMap(packet)
 
 	if tlv := FindTLV(packet.TLVs, 0x10); tlv != nil && len(tlv.Value) >= 2 {
 		n := int(binary.LittleEndian.Uint16(tlv.Value[0:2]))
@@ -1102,12 +1156,14 @@ func parseNetworkScanResults(packet *Packet) []NetworkScanResult {
 				desc = string(tlv.Value[offset : offset+descLen])
 				offset += descLen
 			}
+			includesPCS := pcsMap[[2]uint16{mcc, mnc}]
 			results = append(results, NetworkScanResult{
 				MCC:         fmt.Sprintf("%03d", mcc),
-				MNC:         fmt.Sprintf("%03d", mnc),
+				MNC:         formatNetworkScanMNC(mnc, includesPCS),
 				Status:      status,
 				Description: desc,
 			})
+			rawPLMNs = append(rawPLMNs, rawPLMN{mcc: mcc, mnc: mnc})
 		}
 	}
 
@@ -1118,12 +1174,12 @@ func parseNetworkScanResults(packet *Packet) []NetworkScanResult {
 			if len(tlv.Value)-offset < 5 {
 				break
 			}
-			mcc := fmt.Sprintf("%03d", binary.LittleEndian.Uint16(tlv.Value[offset:offset+2]))
-			mnc := fmt.Sprintf("%03d", binary.LittleEndian.Uint16(tlv.Value[offset+2:offset+4]))
+			mcc := binary.LittleEndian.Uint16(tlv.Value[offset : offset+2])
+			mnc := binary.LittleEndian.Uint16(tlv.Value[offset+2 : offset+4])
 			rat := tlv.Value[offset+4]
 			offset += 5
-			for j := range results {
-				if results[j].MCC == mcc && results[j].MNC == mnc {
+			for j := range rawPLMNs {
+				if rawPLMNs[j].mcc == mcc && rawPLMNs[j].mnc == mnc {
 					results[j].RATs = append(results[j].RATs, rat)
 					break
 				}

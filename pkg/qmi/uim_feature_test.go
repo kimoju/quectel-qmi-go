@@ -702,3 +702,119 @@ func TestUIMRegisterEventsMapsNotSupported(t *testing.T) {
 		t.Fatalf("expected NotSupportedError, got %T: %v", err, err)
 	}
 }
+
+func dualSlotCardStatusPacketSlot2Active(slot2USIMAID []byte) *Packet {
+	// Header: index_gw_pri (2B), index_1x_pri (2B), index_gw_sec (2B), index_1x_sec (2B), num_slot (1B)
+	value := make([]byte, 9)
+	// Primary GW points to slot index 1 (Slot 2), app index 0 => 0x0100
+	binary.LittleEndian.PutUint16(value[0:2], 0x0100)
+	binary.LittleEndian.PutUint16(value[2:4], 0xFFFF)
+	binary.LittleEndian.PutUint16(value[4:6], 0xFFFF)
+	binary.LittleEndian.PutUint16(value[6:8], 0xFFFF)
+	value[8] = 2 // 2 slots
+
+	// Slot 1: absent, 0 apps
+	value = append(value,
+		0x00, // cardState = absent
+		0x00,
+		0x00,
+		0x00,
+		0x01, // errorCode = no SIM
+		0x00, // numApp = 0
+	)
+
+	// Slot 2: present, 1 USIM app ready
+	value = append(value,
+		0x01, // cardState = present
+		byte(PINStatusDisabled),
+		0x03,
+		0x0A,
+		0x00, // errorCode = none
+		0x01, // numApp = 1
+	)
+	value = append(value,
+		UIMAppTypeUSIM,
+		UIMAppStateReady,
+		0x00,
+		0x00,
+		0x00,
+		0x00,
+		byte(len(slot2USIMAID)),
+	)
+	value = append(value, slot2USIMAID...)
+	value = append(value,
+		0x00,                    // UPIN not used
+		byte(PINStatusDisabled), // PIN1 state
+		0x03,
+		0x0A,
+		byte(PINStatusDisabled), // PIN2 state
+		0x03,
+		0x0A,
+	)
+
+	return &Packet{TLVs: []TLV{
+		successResultTLV(),
+		{Type: 0x10, Value: value},
+	}}
+}
+
+func TestUIMServiceDualSlotSelectsSlot2FromPrimaryGW(t *testing.T) {
+	client := newUIMUnitTestClient()
+	slot2AID := []byte{0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02, 0xFF, 0x86, 0x02, 0x99}
+	var iccidSessionTypes []uint8
+
+	// BCD-swapped ICCID "89860123456789012345" -> 0x98, 0x68, 0x10, ...
+	iccidBCD := []byte{0x98, 0x68, 0x10, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0x54}
+
+	stop := serveUIMUnitTestRequests(t, client, func(req *Packet) *Packet {
+		switch req.MessageID {
+		case UIMGetCardStatus:
+			return dualSlotCardStatusPacketSlot2Active(slot2AID)
+		case UIMReadTransparent:
+			sessionTLV := FindTLV(req.TLVs, 0x01)
+			if sessionTLV == nil || len(sessionTLV.Value) < 1 {
+				t.Fatalf("UIMReadTransparent missing session TLV")
+			}
+			iccidSessionTypes = append(iccidSessionTypes, sessionTLV.Value[0])
+			if sessionTLV.Value[0] != UIMSessionTypeCardSlot2 {
+				return qmiErrorPacket(QMIErrNotSupported)
+			}
+			return readTransparentPacket(iccidBCD)
+		default:
+			t.Fatalf("unexpected UIM message 0x%04x", req.MessageID)
+			return nil
+		}
+	})
+	defer stop()
+
+	uim := &UIMService{client: client, clientID: 3}
+	details, simStatus, err := uim.GetCardStatusDetails(context.Background())
+	if err != nil {
+		t.Fatalf("GetCardStatusDetails() error = %v", err)
+	}
+	if simStatus != SIMReady {
+		t.Fatalf("simStatus = %v, want SIMReady", simStatus)
+	}
+	if details.ActiveSlot != 2 || details.PrimaryGWSlot != 2 {
+		t.Fatalf("ActiveSlot=%d PrimaryGWSlot=%d, want 2/2", details.ActiveSlot, details.PrimaryGWSlot)
+	}
+
+	gotAID, err := uim.GetUSIMAID(context.Background())
+	if err != nil {
+		t.Fatalf("GetUSIMAID() error = %v", err)
+	}
+	if !sameBytes(gotAID, slot2AID) {
+		t.Fatalf("GetUSIMAID() = %X, want %X", gotAID, slot2AID)
+	}
+
+	gotICCID, err := uim.GetICCID(context.Background())
+	if err != nil {
+		t.Fatalf("GetICCID() error = %v", err)
+	}
+	if gotICCID != "89860123456789012345" {
+		t.Fatalf("GetICCID() = %q, want %q", gotICCID, "89860123456789012345")
+	}
+	if len(iccidSessionTypes) == 0 || iccidSessionTypes[0] != UIMSessionTypeCardSlot2 {
+		t.Fatalf("GetICCID() tried session types %v, want first session UIMSessionTypeCardSlot2 (0x%02x)", iccidSessionTypes, UIMSessionTypeCardSlot2)
+	}
+}

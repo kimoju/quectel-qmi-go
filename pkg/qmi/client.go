@@ -397,13 +397,22 @@ func newClientWithTransport(path string, opts ClientOptions, conn qmiTransport) 
 
 // Close shuts down the client / Close关闭客户端
 func (c *Client) Close() error {
+	if c == nil {
+		return nil
+	}
 	var err error
 	c.closeOnce.Do(func() {
-		close(c.closeCh)
-		err = c.conn.Close()
+		if c.closeCh != nil {
+			close(c.closeCh)
+		}
+		if c.conn != nil {
+			err = c.conn.Close()
+		}
 		c.wg.Wait()
 		c.failPendingTransactions(fmt.Errorf("client closed"))
-		close(c.eventCh)
+		if c.eventCh != nil {
+			close(c.eventCh)
+		}
 	})
 	return err
 }
@@ -426,9 +435,58 @@ func (c *Client) Stats() ClientStats {
 	}
 }
 
+func (c *Client) allocateTransaction(service uint8, msgID uint16, respCh chan *Packet, deadline time.Time) (uint16, uint32, *transactionEntry, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.transactions == nil {
+		c.transactions = make(map[uint32]*transactionEntry)
+	}
+
+	var maxAttempts int
+	if service == ServiceControl {
+		maxAttempts = 255
+	} else {
+		maxAttempts = 65535
+	}
+
+	for i := 0; i < maxAttempts; i++ {
+		var cand uint16
+		if service == ServiceControl {
+			cand = uint16(atomic.AddUint32(&c.ctlTxID, 1) & 0xFF)
+			if cand == 0 {
+				cand = uint16(atomic.AddUint32(&c.ctlTxID, 1) & 0xFF)
+			}
+		} else {
+			cand = uint16(atomic.AddUint32(&c.lastTxID, 1) & 0xFFFF)
+			if cand == 0 {
+				cand = uint16(atomic.AddUint32(&c.lastTxID, 1) & 0xFFFF)
+			}
+		}
+		key := uint32(service)<<16 | uint32(cand)
+		if _, exists := c.transactions[key]; exists {
+			continue
+		}
+		entry := &transactionEntry{
+			ch:       respCh,
+			service:  service,
+			msgID:    msgID,
+			txID:     cand,
+			start:    time.Now(),
+			deadline: deadline,
+		}
+		c.transactions[key] = entry
+		return cand, key, entry, nil
+	}
+
+	return 0, 0, nil, fmt.Errorf("QMI transaction IDs exhausted for service 0x%02x", service)
+}
+
 func (c *Client) completeTransaction(key uint32, entry *transactionEntry, cause error) {
 	c.mu.Lock()
-	delete(c.transactions, key)
+	if c.transactions[key] == entry {
+		delete(c.transactions, key)
+	}
 	if isContextDone(cause) && entry != nil {
 		c.rememberRecentTransactionLocked(key, entry, cause)
 	}
@@ -614,22 +672,27 @@ func (c *Client) readLoop() {
 			entry, ok := c.transactions[key]
 			c.mu.Unlock()
 
-			if ok && !packet.IsIndication {
-				select {
-				case entry.ch <- packet:
-				default:
-				}
-				continue
-			}
-
-			if !packet.IsIndication && packet.ServiceType != ServiceControl {
-				c.unmatchedResponses.Add(1)
-				if recent, ok := c.takeRecentTransaction(key, packet.ServiceType, packet.MessageID); ok {
-					c.logLateResponse(key, packet, recent)
+			if !packet.IsIndication {
+				if ok {
+					select {
+					case entry.ch <- packet:
+					default:
+					}
 					continue
 				}
-				c.logf(ClientLogLevelDebug, "QMI: received response with unmatched key 0x%08x (MsgID 0x%04x, Service 0x%02x, TxID %d)",
-					key, packet.MessageID, packet.ServiceType, packet.TransactionID)
+				if packet.ServiceType != ServiceControl {
+					c.unmatchedResponses.Add(1)
+					if recent, ok := c.takeRecentTransaction(key, packet.ServiceType, packet.MessageID); ok {
+						c.logLateResponse(key, packet, recent)
+						continue
+					}
+					c.logf(ClientLogLevelDebug, "QMI: received response with unmatched key 0x%08x (MsgID 0x%04x, Service 0x%02x, TxID %d)",
+						key, packet.MessageID, packet.ServiceType, packet.TransactionID)
+				} else if recent, ok := c.takeRecentTransaction(key, packet.ServiceType, packet.MessageID); ok {
+					c.unmatchedResponses.Add(1)
+					c.logLateResponse(key, packet, recent)
+				}
+				continue
 			}
 			c.dispatchIndication(packet)
 		}
@@ -891,6 +954,9 @@ func (c *Client) handleClientIDRevoke(p *Packet) {
 
 // SendRequest sends a QMI request and waits for response / SendRequest发送QMI请求并等待响应
 func (c *Client) SendRequest(ctx context.Context, service uint8, clientID uint8, msgID uint16, tlvs []TLV) (resp *Packet, err error) {
+	if c == nil || c.writeCh == nil {
+		return nil, fmt.Errorf("qmi client not initialized")
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -906,35 +972,13 @@ func (c *Client) SendRequest(ctx context.Context, service uint8, clientID uint8,
 		return nil, err
 	}
 
-	// Allocate transaction ID / 分配事务ID
-	var txID uint16
-	if service == ServiceControl {
-		txID = uint16(atomic.AddUint32(&c.ctlTxID, 1) & 0xFF)
-		if txID == 0 {
-			txID = uint16(atomic.AddUint32(&c.ctlTxID, 1) & 0xFF)
-		}
-	} else {
-		txID = uint16(atomic.AddUint32(&c.lastTxID, 1) & 0xFFFF)
-		if txID == 0 {
-			txID = uint16(atomic.AddUint32(&c.lastTxID, 1) & 0xFFFF)
-		}
-	}
-
-	// Create response channel / 创建响应通道
+	// Allocate transaction ID and register response channel without colliding with in-flight transactions
 	respCh := make(chan *Packet, 1)
-	key := uint32(service)<<16 | uint32(txID)
 	deadline, _ := ctx.Deadline()
-	entry := &transactionEntry{
-		ch:       respCh,
-		service:  service,
-		msgID:    msgID,
-		txID:     txID,
-		start:    time.Now(),
-		deadline: deadline,
+	txID, key, entry, allocErr := c.allocateTransaction(service, msgID, respCh, deadline)
+	if allocErr != nil {
+		return nil, allocErr
 	}
-	c.mu.Lock()
-	c.transactions[key] = entry
-	c.mu.Unlock()
 
 	defer func() {
 		c.completeTransaction(key, entry, err)
@@ -1066,6 +1110,9 @@ func (c *Client) ReleaseClientID(service uint8, clientID uint8) error {
 }
 
 func (c *Client) ReleaseClientIDWithContext(ctx context.Context, service uint8, clientID uint8) error {
+	if c == nil {
+		return nil
+	}
 	// Build request: TLV 0x01 = {service, clientID} / 构建请求: TLV 0x01 = {服务, clientID}
 	tlvs := []TLV{{Type: 0x01, Value: []byte{service, clientID}}}
 

@@ -547,7 +547,94 @@ func TestParseIncrementalNetworkScanIndication(t *testing.T) {
 	if !info.ScanComplete || len(info.Results) != 1 {
 		t.Fatalf("unexpected incremental scan payload: %+v", info)
 	}
-	if got := info.Results[0]; got.MCC != "460" || got.MNC != "001" || len(got.RATs) != 1 || got.RATs[0] != 0x08 {
+	if got := info.Results[0]; got.MCC != "460" || got.MNC != "01" || len(got.RATs) != 1 || got.RATs[0] != 0x08 {
 		t.Fatalf("unexpected incremental scan entry: %+v", got)
+	}
+}
+
+func TestParseNetworkScanResults2DigitAnd3DigitMNC(t *testing.T) {
+	appendEntry10 := func(buf []byte, mcc, mnc uint16, status uint8, desc string) []byte {
+		var tmp [4]byte
+		binary.LittleEndian.PutUint16(tmp[0:2], mcc)
+		binary.LittleEndian.PutUint16(tmp[2:4], mnc)
+		buf = append(buf, tmp[:]...)
+		buf = append(buf, status, byte(len(desc)))
+		buf = append(buf, []byte(desc)...)
+		return buf
+	}
+	appendEntry11 := func(buf []byte, mcc, mnc uint16, rat uint8) []byte {
+		var tmp [4]byte
+		binary.LittleEndian.PutUint16(tmp[0:2], mcc)
+		binary.LittleEndian.PutUint16(tmp[2:4], mnc)
+		buf = append(buf, tmp[:]...)
+		buf = append(buf, rat)
+		return buf
+	}
+	appendPCS := func(buf []byte, mcc, mnc uint16, includesPCS bool) []byte {
+		var tmp [4]byte
+		binary.LittleEndian.PutUint16(tmp[0:2], mcc)
+		binary.LittleEndian.PutUint16(tmp[2:4], mnc)
+		buf = append(buf, tmp[:]...)
+		if includesPCS {
+			buf = append(buf, 0x01)
+		} else {
+			buf = append(buf, 0x00)
+		}
+		return buf
+	}
+
+	tlv10 := []byte{0x04, 0x00}
+	tlv10 = appendEntry10(tlv10, 460, 0, 0x01, "CMCC")
+	tlv10 = appendEntry10(tlv10, 460, 1, 0x02, "CUCC")
+	tlv10 = appendEntry10(tlv10, 310, 10, 0x01, "MCI")
+	tlv10 = appendEntry10(tlv10, 310, 260, 0x01, "T-Mobile")
+
+	tlv11 := []byte{0x05, 0x00}
+	tlv11 = appendEntry11(tlv11, 460, 0, 0x08)
+	tlv11 = appendEntry11(tlv11, 460, 1, 0x08)
+	tlv11 = appendEntry11(tlv11, 460, 1, 0x0C)
+	tlv11 = appendEntry11(tlv11, 310, 10, 0x08)
+	tlv11 = appendEntry11(tlv11, 310, 260, 0x08)
+
+	tlv12 := []byte{0x04, 0x00}
+	tlv12 = appendPCS(tlv12, 460, 0, false)
+	tlv12 = appendPCS(tlv12, 460, 1, false)
+	tlv12 = appendPCS(tlv12, 310, 10, true)
+	tlv12 = appendPCS(tlv12, 310, 260, true)
+
+	resp := &Packet{
+		ServiceType: ServiceNAS,
+		MessageID:   NASPerformNetworkScan,
+		TLVs: []TLV{
+			successResultTLV(),
+			{Type: 0x10, Value: tlv10},
+			{Type: 0x11, Value: tlv11},
+			{Type: 0x12, Value: tlv12},
+		},
+	}
+
+	results := parseNetworkScanResults(resp)
+	if len(results) != 4 {
+		t.Fatalf("len(results) = %d, want 4", len(results))
+	}
+
+	want := []struct {
+		mcc  string
+		mnc  string
+		rats []uint8
+	}{
+		{mcc: "460", mnc: "00", rats: []uint8{0x08}},
+		{mcc: "460", mnc: "01", rats: []uint8{0x08, 0x0C}},
+		{mcc: "310", mnc: "010", rats: []uint8{0x08}},
+		{mcc: "310", mnc: "260", rats: []uint8{0x08}},
+	}
+	for i, w := range want {
+		got := results[i]
+		if got.MCC != w.mcc || got.MNC != w.mnc {
+			t.Fatalf("results[%d] PLMN = %s-%s, want %s-%s", i, got.MCC, got.MNC, w.mcc, w.mnc)
+		}
+		if string(got.RATs) != string(w.rats) {
+			t.Fatalf("results[%d] RATs = %v, want %v", i, got.RATs, w.rats)
+		}
 	}
 }

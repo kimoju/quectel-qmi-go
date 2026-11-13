@@ -867,3 +867,135 @@ func TestStopCancelsRecoveryRetryWhenCoreNotReadyDisconnected(t *testing.T) {
 		t.Fatal("expected Stop() to cancel manager context")
 	}
 }
+
+func TestLazyEnsureAndRebindServicesReRegisterIndications(t *testing.T) {
+	t.Run("NAS lazy ensure and rebind replay indications", func(t *testing.T) {
+		m := newRecoveryTestManager()
+		m.client = &qmi.Client{}
+		allocs := 0
+		indRegs := 0
+		m.newNASService = func(context.Context, *qmi.Client) (*qmi.NASService, error) {
+			allocs++
+			return &qmi.NASService{}, nil
+		}
+		m.registerNASIndications = func(_ context.Context, cfg qmi.NASIndicationRegistration) error {
+			indRegs++
+			if !cfg.ServingSystemChanged || !cfg.SystemInfo || !cfg.SignalInfo {
+				t.Fatalf("unexpected NAS indication registration config: %+v", cfg)
+			}
+			return nil
+		}
+
+		if _, err := m.ensureNASService(); err != nil {
+			t.Fatalf("ensureNASService() error = %v", err)
+		}
+		if allocs != 1 || indRegs != 1 {
+			t.Fatalf("after ensureNASService: allocs=%d indRegs=%d, want 1/1", allocs, indRegs)
+		}
+
+		if _, err := m.rebindNASService("test_rebind"); err != nil {
+			t.Fatalf("rebindNASService() error = %v", err)
+		}
+		if allocs != 2 || indRegs != 2 {
+			t.Fatalf("after rebindNASService: allocs=%d indRegs=%d, want 2/2", allocs, indRegs)
+		}
+	})
+
+	t.Run("UIM lazy ensure and rebind replay indications", func(t *testing.T) {
+		m := newRecoveryTestManager()
+		m.client = &qmi.Client{}
+		allocs := 0
+		indRegs := 0
+		m.newUIMService = func(context.Context, *qmi.Client) (*qmi.UIMService, error) {
+			allocs++
+			return &qmi.UIMService{}, nil
+		}
+		m.registerUIMIndications = func(context.Context) (uint32, error) {
+			indRegs++
+			return m.uimIndicationRegistrationMask(), nil
+		}
+
+		if _, err := m.ensureUIMService(); err != nil {
+			t.Fatalf("ensureUIMService() error = %v", err)
+		}
+		if allocs != 1 || indRegs != 1 {
+			t.Fatalf("after ensureUIMService: allocs=%d indRegs=%d, want 1/1", allocs, indRegs)
+		}
+
+		if _, err := m.rebindUIMService("test_rebind"); err != nil {
+			t.Fatalf("rebindUIMService() error = %v", err)
+		}
+		if allocs != 2 || indRegs != 2 {
+			t.Fatalf("after rebindUIMService: allocs=%d indRegs=%d, want 2/2", allocs, indRegs)
+		}
+	})
+
+	t.Run("VOICE lazy ensure and rebind replay indications", func(t *testing.T) {
+		m := newRecoveryTestManager()
+		m.client = &qmi.Client{}
+		allocs := 0
+		indRegs := 0
+		m.newVOICEService = func(context.Context, *qmi.Client) (*qmi.VOICEService, error) {
+			allocs++
+			return &qmi.VOICEService{}, nil
+		}
+		m.registerVOICEIndications = func(_ context.Context, cfg qmi.VoiceIndicationRegistration) error {
+			indRegs++
+			if !cfg.CallNotificationEvents || !cfg.USSDNotificationEvents {
+				t.Fatalf("unexpected VOICE indication registration config: %+v", cfg)
+			}
+			return nil
+		}
+
+		if _, err := m.ensureVOICEService(); err != nil {
+			t.Fatalf("ensureVOICEService() error = %v", err)
+		}
+		if allocs != 1 || indRegs != 1 {
+			t.Fatalf("after ensureVOICEService: allocs=%d indRegs=%d, want 1/1", allocs, indRegs)
+		}
+
+		if _, err := m.rebindVOICEService("test_rebind"); err != nil {
+			t.Fatalf("rebindVOICEService() error = %v", err)
+		}
+		if allocs != 2 || indRegs != 2 {
+			t.Fatalf("after rebindVOICEService: allocs=%d indRegs=%d, want 2/2", allocs, indRegs)
+		}
+	})
+
+	t.Run("WMS lazy ensure replays WMS state and indications without lock reentrancy", func(t *testing.T) {
+		m := newRecoveryTestManager()
+		m.client = &qmi.Client{}
+		allocs := 0
+		eventReportRegs := 0
+		wmsIndRegs := 0
+		m.newWMSService = func(context.Context, *qmi.Client) (*qmi.WMSService, error) {
+			allocs++
+			return &qmi.WMSService{}, nil
+		}
+		m.registerWMSEventReport = func(context.Context) error {
+			// Verify ensureWMSService may be called re-entrantly inside recovery without deadlocking!
+			if _, err := m.ensureWMSService(); err != nil {
+				t.Errorf("re-entrant ensureWMSService() error = %v", err)
+			}
+			eventReportRegs++
+			return nil
+		}
+		m.registerWMSIndications = func(context.Context, bool) error {
+			wmsIndRegs++
+			return nil
+		}
+		m.queryWMSTransportState = func(context.Context) (qmi.WMSTransportNetworkRegistration, error) {
+			return qmi.WMSTransportNetworkRegistrationFullService, nil
+		}
+		m.queryWMSRoutes = func(context.Context) (*qmi.WMSRouteConfig, error) {
+			return &qmi.WMSRouteConfig{Routes: []qmi.WMSRoute{{MessageType: 0x00, MessageClass: 0x01, StorageType: 0x01, ReceiptAction: 0x01}}}, nil
+		}
+
+		if _, err := m.ensureWMSService(); err != nil {
+			t.Fatalf("ensureWMSService() error = %v", err)
+		}
+		if allocs != 1 || eventReportRegs != 1 || wmsIndRegs != 1 {
+			t.Fatalf("after ensureWMSService: allocs=%d eventReportRegs=%d wmsIndRegs=%d, want 1/1/1", allocs, eventReportRegs, wmsIndRegs)
+		}
+	})
+}

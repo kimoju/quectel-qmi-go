@@ -493,25 +493,27 @@ func (w *WMSService) GetSMSCAddress(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	return parseGetSMSCAddressResponse(resp)
+}
+
+func parseGetSMSCAddressResponse(resp *Packet) (string, error) {
 	if err := resp.CheckResult(); err != nil {
 		return "", err
 	}
 
-	// TLV 0x01: SMSC Address / 短信中心地址
-	// Type(3 bytes for type/length) + Address...
-	// Usually: [Type(3 chars string)] [Length(1)] [Digits...]
-	// But QMI spec says:
-	// string SMSCAddressType (max 3)
-	// string SMSCAddress (max 20)
-	// Let's look for TLV 0x01
-	tlv := FindTLV(resp.TLVs, 0x01)
+	tlv := FindTLV(resp.TLVs, 0x10)
+	if tlv == nil {
+		tlv = FindTLV(resp.TLVs, 0x01)
+	}
 	if tlv == nil {
 		return "", fmt.Errorf("SMSC address TLV not found")
 	}
 
-	// Parse as string for simplicity, though it might be binary encoded digits
-	// Typically ASCII for type, and ASCII digits for address
-	return string(tlv.Value), nil
+	addr, err := parseWMSSMSCAddressValue(tlv.Value)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(addr.Digits), nil
 }
 
 // RegisterEventReport enables indications for new messages / RegisterEventReport 开启新消息指示

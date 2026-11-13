@@ -304,3 +304,108 @@ func TestManagerGetSMSCUsesManagerAPDUTransport(t *testing.T) {
 		t.Fatal("expected GetSMSC to use manager APDU transport")
 	}
 }
+
+func TestParseLinearFixedMetaFromFCPMultiByteBERLength(t *testing.T) {
+	buildFCP := func(paddingLen int) []byte {
+		// File descriptor TLV: 0x82, len=5, linear fixed (0x42), 0x21, 0x00, recordLen=0x2A, count=0x02
+		fd := []byte{0x82, 0x05, 0x42, 0x21, 0x00, 0x2A, 0x02}
+
+		var padTLV []byte
+		if paddingLen <= 127 {
+			padTLV = append([]byte{0xA5, byte(paddingLen)}, make([]byte, paddingLen)...)
+		} else if paddingLen <= 255 {
+			padTLV = append([]byte{0xA5, 0x81, byte(paddingLen)}, make([]byte, paddingLen)...)
+		} else {
+			padTLV = append([]byte{0xA5, 0x82, byte(paddingLen >> 8), byte(paddingLen)}, make([]byte, paddingLen)...)
+		}
+
+		body := append(padTLV, fd...)
+		if len(body) <= 127 {
+			return append([]byte{0x62, byte(len(body))}, body...)
+		}
+		if len(body) <= 255 {
+			return append([]byte{0x62, 0x81, byte(len(body))}, body...)
+		}
+		return append([]byte{0x62, 0x82, byte(len(body) >> 8), byte(len(body))}, body...)
+	}
+
+	t.Run("BER 0x81 single-byte extended length", func(t *testing.T) {
+		fcp := buildFCP(150) // total body > 127 && <= 255 => 0x62 0x81 <len>
+		recordLen, count := parseLinearFixedMetaFromFCP(fcp)
+		if recordLen != 0x2A || count != 2 {
+			t.Fatalf("got recordLen=0x%x count=%d, want 0x2a/2", recordLen, count)
+		}
+	})
+
+	t.Run("BER 0x82 two-byte extended length", func(t *testing.T) {
+		fcp := buildFCP(280) // total body > 255 => 0x62 0x82 <hi> <lo>
+		recordLen, count := parseLinearFixedMetaFromFCP(fcp)
+		if recordLen != 0x2A || count != 2 {
+			t.Fatalf("got recordLen=0x%x count=%d, want 0x2a/2", recordLen, count)
+		}
+	})
+}
+
+func TestManagerGetSMSCUsesActiveSlot2FromUIMCardStatus(t *testing.T) {
+	record := make([]byte, 0x2A)
+	for i := range record {
+		record[i] = 0xFF
+	}
+	copy(record[13:], encodeAddress("+8613800100500"))
+	fcp := []byte{
+		0x62, 0x07,
+		0x82, 0x05, 0x42, 0x21, 0x00, 0x2A, 0x01,
+	}
+	script := &apduScript{
+		responses: map[string][][]byte{
+			"00A40004026F42": {append(append([]byte{}, fcp...), 0x90, 0x00)},
+			"00B201042A":     {append(append([]byte{}, record...), 0x90, 0x00)},
+		},
+	}
+
+	// Build 2-slot UIMGetCardStatus packet where PrimaryGWSlot=2 (index_gw_pri = 0x0100)
+	cardStatusValue := []byte{
+		0x00, 0x01, // index_gw_pri = 0x0100 (Slot 2, App 0)
+		0xFF, 0xFF,
+		0xFF, 0xFF,
+		0xFF, 0xFF,
+		0x02, // 2 slots
+		// Slot 1: absent
+		0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+		// Slot 2: present, 0 apps needed for slot selection
+		0x01, 0x00, 0x03, 0x0A, 0x00, 0x00,
+	}
+	uimSvc := newUIMReadinessTestService(t, func(req *qmi.Packet) (*qmi.Packet, error) {
+		if req.MessageID == qmi.UIMGetCardStatus {
+			return &qmi.Packet{
+				TLVs: []qmi.TLV{
+					{Type: 0x02, Value: []byte{0x00, 0x00, 0x00, 0x00}},
+					{Type: 0x10, Value: cardStatusValue},
+				},
+			}, nil
+		}
+		return nil, errors.New("unexpected UIM request")
+	})
+
+	m := newRecoveryTestManager()
+	m.uim = uimSvc
+	var usedSlots []uint8
+	m.sendAPDUHook = func(ctx context.Context, slot uint8, channel uint8, command []byte) ([]byte, error) {
+		usedSlots = append(usedSlots, slot)
+		if slot != 2 {
+			return []byte{0x6A, 0x82}, nil
+		}
+		return script.send(command)
+	}
+
+	got, err := m.GetSMSC(context.Background())
+	if err != nil {
+		t.Fatalf("GetSMSC() error = %v", err)
+	}
+	if got != "+8613800100500" {
+		t.Fatalf("GetSMSC() = %q, want %q", got, "+8613800100500")
+	}
+	if len(usedSlots) == 0 || usedSlots[0] != 2 {
+		t.Fatalf("GetSMSC() used APDU slots %v, want slot 2", usedSlots)
+	}
+}

@@ -7,17 +7,39 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/kimoju/netlink"
 )
 
 // LinuxConfigurator implements NetworkConfigurator for Linux using netlink
 // LinuxConfigurator 使用 netlink 实现 Linux 的 NetworkConfigurator
-type LinuxConfigurator struct{}
+type LinuxConfigurator struct {
+	dnsMu          sync.Mutex
+	resolvConfPath string
+	sysClassNetDir string
+	parentIndexFn  func(muxIface, masterIface string) (bool, bool)
+}
 
 func NewLinuxConfigurator() *LinuxConfigurator {
 	return &LinuxConfigurator{}
+}
+
+func (l *LinuxConfigurator) resolvPath() string {
+	if l != nil && l.resolvConfPath != "" {
+		return l.resolvConfPath
+	}
+	return defaultResolvConfPath
+}
+
+func (l *LinuxConfigurator) sysNetDir() string {
+	if l != nil && l.sysClassNetDir != "" {
+		return l.sysClassNetDir
+	}
+	return defaultSysClassNetDir
 }
 
 func (l *LinuxConfigurator) SetIPAddress(ifname string, ip net.IP, prefixLen int) error {
@@ -201,43 +223,141 @@ func (l *LinuxConfigurator) IsUp(ifname string) (bool, error) {
 	return link.Attrs().Flags&net.FlagUp != 0, nil
 }
 
-const resolvConfPath = "/etc/resolv.conf"
+const (
+	defaultResolvConfPath = "/etc/resolv.conf"
+	defaultSysClassNetDir = "/sys/class/net"
+	managedDNSBeginMarker = "# BEGIN quectel-qmi-go-dns"
+	managedDNSEndMarker   = "# END quectel-qmi-go-dns"
+	managedDNSBackupTag   = "# quectel-qmi-go-backup: "
+)
+
+func collectDNSServers(dns1, dns2 string) []string {
+	var servers []string
+	d1 := strings.TrimSpace(dns1)
+	d2 := strings.TrimSpace(dns2)
+	if d1 != "" {
+		servers = append(servers, d1)
+	}
+	if d2 != "" && d2 != d1 {
+		servers = append(servers, d2)
+	}
+	return servers
+}
+
+func splitResolvLines(data []byte) []string {
+	raw := strings.ReplaceAll(string(data), "\r\n", "\n")
+	raw = strings.TrimSuffix(raw, "\n")
+	if raw == "" {
+		return nil
+	}
+	return strings.Split(raw, "\n")
+}
 
 func (l *LinuxConfigurator) UpdateDNS(dns1, dns2 string) error {
-	var lines []string
-	if data, err := os.ReadFile(resolvConfPath); err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			if !strings.HasPrefix(strings.TrimSpace(line), "nameserver") {
-				lines = append(lines, line)
-			}
+	servers := collectDNSServers(dns1, dns2)
+	if len(servers) == 0 {
+		return nil
+	}
+
+	l.dnsMu.Lock()
+	defer l.dnsMu.Unlock()
+
+	path := l.resolvPath()
+	var existingLines []string
+	if data, err := os.ReadFile(path); err == nil {
+		existingLines = splitResolvLines(data)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	var kept []string
+	inManagedBlock := false
+	for _, line := range existingLines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == managedDNSBeginMarker {
+			inManagedBlock = true
+			continue
 		}
+		if trimmed == managedDNSEndMarker {
+			inManagedBlock = false
+			continue
+		}
+		if inManagedBlock {
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) >= 2 && fields[0] == "nameserver" {
+			kept = append(kept, managedDNSBackupTag+trimmed)
+			continue
+		}
+		kept = append(kept, line)
 	}
 
-	if dns1 != "" {
-		lines = append(lines, "nameserver "+dns1)
+	out := make([]string, 0, len(kept)+len(servers)+2)
+	out = append(out, kept...)
+	out = append(out, managedDNSBeginMarker)
+	for _, srv := range servers {
+		out = append(out, "nameserver "+srv)
 	}
-	if dns2 != "" && dns2 != dns1 {
-		lines = append(lines, "nameserver "+dns2)
-	}
+	out = append(out, managedDNSEndMarker)
 
-	content := strings.Join(lines, "\n")
-	if !strings.HasSuffix(content, "\n") {
-		content += "\n"
-	}
-	return os.WriteFile(resolvConfPath, []byte(content), 0644)
+	content := strings.Join(out, "\n") + "\n"
+	return os.WriteFile(path, []byte(content), 0644)
 }
 
 func (l *LinuxConfigurator) RestoreDNS() error {
-	var lines []string
-	if data, err := os.ReadFile(resolvConfPath); err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			if !strings.HasPrefix(strings.TrimSpace(line), "nameserver") {
-				lines = append(lines, line)
-			}
+	l.dnsMu.Lock()
+	defer l.dnsMu.Unlock()
+
+	path := l.resolvPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
 		}
+		return err
 	}
-	content := strings.Join(lines, "\n")
-	return os.WriteFile(resolvConfPath, []byte(content), 0644)
+
+	existingLines := splitResolvLines(data)
+	var out []string
+	inManagedBlock := false
+	changed := false
+	for _, line := range existingLines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == managedDNSBeginMarker {
+			inManagedBlock = true
+			changed = true
+			continue
+		}
+		if trimmed == managedDNSEndMarker {
+			inManagedBlock = false
+			changed = true
+			continue
+		}
+		if inManagedBlock {
+			changed = true
+			continue
+		}
+		if strings.HasPrefix(trimmed, managedDNSBackupTag) {
+			restored := strings.TrimSpace(strings.TrimPrefix(trimmed, managedDNSBackupTag))
+			if restored != "" {
+				out = append(out, restored)
+			}
+			changed = true
+			continue
+		}
+		out = append(out, line)
+	}
+
+	if !changed {
+		return nil
+	}
+
+	content := ""
+	if len(out) > 0 {
+		content = strings.Join(out, "\n") + "\n"
+	}
+	return os.WriteFile(path, []byte(content), 0644)
 }
 
 // ============================================================================
@@ -248,7 +368,8 @@ func (l *LinuxConfigurator) RestoreDNS() error {
 // 等同于: echo {muxID} > /sys/class/net/{masterIface}/qmi/add_mux
 // 返回值为创建出的虚拟网卡名，例如 "qmimux0"
 func (l *LinuxConfigurator) AddQMAPMux(masterIface string, muxID uint8) (string, error) {
-	addMuxPath := fmt.Sprintf("/sys/class/net/%s/qmi/add_mux", masterIface)
+	sysNet := l.sysNetDir()
+	addMuxPath := filepath.Join(sysNet, masterIface, "qmi", "add_mux")
 
 	// 检查 sysfs 节点是否存在
 	if _, err := os.Stat(addMuxPath); os.IsNotExist(err) {
@@ -279,7 +400,7 @@ func (l *LinuxConfigurator) AddQMAPMux(masterIface string, muxID uint8) (string,
 // DelQMAPMux 销毁指定 MuxID 对应的虚拟网卡
 // 等同于: echo {muxID} > /sys/class/net/{masterIface}/qmi/del_mux
 func (l *LinuxConfigurator) DelQMAPMux(masterIface string, muxID uint8) error {
-	delMuxPath := fmt.Sprintf("/sys/class/net/%s/qmi/del_mux", masterIface)
+	delMuxPath := filepath.Join(l.sysNetDir(), masterIface, "qmi", "del_mux")
 
 	if _, err := os.Stat(delMuxPath); os.IsNotExist(err) {
 		return nil // 节点不存在就认为无需清理
@@ -292,44 +413,131 @@ func (l *LinuxConfigurator) DelQMAPMux(masterIface string, muxID uint8) error {
 	return nil
 }
 
-// GetQMAPMuxIface 根据 MuxID 推导虚拟网卡接口名
-// qmi_wwan 驱动的命名规则: qmimux{muxID - 1}，即 MuxID=1 对应 qmimux0
-func (l *LinuxConfigurator) GetQMAPMuxIface(masterIface string, muxID uint8) string {
-	// qmi_wwan 驱动创建的虚拟网卡名为 qmimux{N}，N 从 0 开始递增
-	// MuxID=1 => qmimux0, MuxID=2 => qmimux1, ...
-	// 但实际命名取决于创建顺序而非 MuxID 值
-	// 因此我们需要扫描 sysfs 确认
+func matchesQMAPMuxID(raw string, muxID uint8) bool {
+	val := strings.TrimSpace(raw)
+	if val == "" {
+		return false
+	}
+	parsed, err := strconv.ParseUint(val, 0, 8)
+	if err == nil {
+		return uint8(parsed) == muxID
+	}
+	return strings.EqualFold(val, fmt.Sprintf("0x%x", muxID)) ||
+		strings.EqualFold(val, fmt.Sprintf("0x%02x", muxID)) ||
+		val == fmt.Sprintf("%d", muxID)
+}
 
-	// 方式1: 扫描 /sys/class/net/ 下所有 qmimux* 开头的接口
-	// 并检查其 upper 设备是否是 masterIface
-	entries, err := os.ReadDir("/sys/class/net")
-	if err != nil {
-		return ""
+func (l *LinuxConfigurator) isQMAPMuxBoundToMaster(muxIface, masterIface string) bool {
+	masterIface = strings.TrimSpace(masterIface)
+	muxIface = strings.TrimSpace(muxIface)
+	if muxIface == "" || muxIface == masterIface {
+		return false
+	}
+	if masterIface == "" {
+		return true
 	}
 
-	for _, entry := range entries {
-		name := entry.Name()
-		if !strings.HasPrefix(name, "qmimux") {
-			continue
-		}
-		// 检查该虚拟网卡是否属于目标物理网卡
-		// 读取 /sys/class/net/qmimuxN/qmap/mux_id
-		muxIDPath := fmt.Sprintf("/sys/class/net/%s/qmap/mux_id", name)
-		if data, err := os.ReadFile(muxIDPath); err == nil {
-			val := strings.TrimSpace(string(data))
-			expected := fmt.Sprintf("0x%x", muxID)
-			expectedDec := fmt.Sprintf("%d", muxID)
-			if val == expected || val == expectedDec {
-				return name
+	sysNet := l.sysNetDir()
+	muxDir := filepath.Join(sysNet, muxIface)
+	masterDir := filepath.Join(sysNet, masterIface)
+
+	// 1. Direct sysfs netdev upper/lower relationship:
+	//    /sys/class/net/<muxIface>/lower_<masterIface> or /sys/class/net/<masterIface>/upper_<muxIface>
+	if _, err := os.Lstat(filepath.Join(muxDir, "lower_"+masterIface)); err == nil {
+		return true
+	}
+	if _, err := os.Lstat(filepath.Join(masterDir, "upper_"+muxIface)); err == nil {
+		return true
+	}
+
+	// If <muxIface> explicitly points to a lower_<otherMaster>, it belongs to another modem.
+	if muxEntries, err := os.ReadDir(muxDir); err == nil {
+		for _, e := range muxEntries {
+			if strings.HasPrefix(e.Name(), "lower_") {
+				return e.Name() == "lower_"+masterIface
 			}
 		}
 	}
 
-	// 方式2: 如果上面没找到，尝试直接用常规命名推导
-	// 这是一个备选逻辑: 假设 MuxID=1 => qmimux0
+	// 2. Netlink IFLA_LINK (ParentIndex == master.Index)
+	if l != nil && l.parentIndexFn != nil {
+		if matches, known := l.parentIndexFn(muxIface, masterIface); known {
+			return matches
+		}
+	} else if sysNet == defaultSysClassNetDir {
+		masterLink, mErr := netlink.LinkByName(masterIface)
+		muxLink, xErr := netlink.LinkByName(muxIface)
+		if mErr == nil && xErr == nil && masterLink != nil && muxLink != nil {
+			mAttrs := masterLink.Attrs()
+			xAttrs := muxLink.Attrs()
+			if mAttrs != nil && xAttrs != nil && xAttrs.ParentIndex > 0 && mAttrs.Index > 0 {
+				return xAttrs.ParentIndex == mAttrs.Index
+			}
+		}
+	}
+
+	// 3. Shared underlying USB interface device in sysfs (/sys/class/net/<iface>/device)
+	muxDev, err1 := filepath.EvalSymlinks(filepath.Join(muxDir, "device"))
+	masterDev, err2 := filepath.EvalSymlinks(filepath.Join(masterDir, "device"))
+	if err1 == nil && err2 == nil && muxDev != "" && muxDev == masterDev {
+		return true
+	}
+	if err1 == nil {
+		if masterReal, errM := filepath.EvalSymlinks(masterDir); errM == nil && muxDev == masterReal {
+			return true
+		}
+	}
+
+	return false
+}
+
+// GetQMAPMuxIface 根据 masterIface 和 MuxID 查找归属于该物理网卡的 QMAP 虚拟网卡接口名
+func (l *LinuxConfigurator) GetQMAPMuxIface(masterIface string, muxID uint8) string {
+	if muxID == 0 {
+		return ""
+	}
+	sysNet := l.sysNetDir()
+	entries, err := os.ReadDir(sysNet)
+	if err != nil {
+		return ""
+	}
+
+	masterIface = strings.TrimSpace(masterIface)
+
+	// 优先扫描绑定到 masterIface 且存在 qmap/mux_id 匹配的接口
+	var boundWithoutMuxID []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == masterIface {
+			continue
+		}
+		if !strings.HasPrefix(name, "qmimux") && masterIface == "" {
+			continue
+		}
+		if !l.isQMAPMuxBoundToMaster(name, masterIface) {
+			continue
+		}
+		muxIDPath := filepath.Join(sysNet, name, "qmap", "mux_id")
+		if data, err := os.ReadFile(muxIDPath); err == nil {
+			if matchesQMAPMuxID(string(data), muxID) {
+				return name
+			}
+			continue
+		} else if os.IsNotExist(err) && strings.HasPrefix(name, "qmimux") {
+			boundWithoutMuxID = append(boundWithoutMuxID, name)
+		}
+	}
+
+	// 兼容旧版内核未暴露 qmap/mux_id 属性的情况：
+	// 仅在不存在 qmap/mux_id 且明确归属于 masterIface（或未指定 masterIface）的候选接口中选择。
 	candidate := fmt.Sprintf("qmimux%d", muxID-1)
-	if _, err := os.Stat(fmt.Sprintf("/sys/class/net/%s", candidate)); err == nil {
-		return candidate
+	for _, name := range boundWithoutMuxID {
+		if name == candidate {
+			return name
+		}
+	}
+	if masterIface != "" && len(boundWithoutMuxID) == 1 {
+		return boundWithoutMuxID[0]
 	}
 
 	return ""
@@ -338,7 +546,7 @@ func (l *LinuxConfigurator) GetQMAPMuxIface(masterIface string, muxID uint8) str
 // EnableRawIP 在物理网卡上开启 Raw IP 模式（QMAP 前置条件）
 // 等同于: echo Y > /sys/class/net/{ifname}/qmi/raw_ip
 func (l *LinuxConfigurator) EnableRawIP(ifname string) error {
-	rawIPPath := fmt.Sprintf("/sys/class/net/%s/qmi/raw_ip", ifname)
+	rawIPPath := filepath.Join(l.sysNetDir(), ifname, "qmi", "raw_ip")
 
 	if _, err := os.Stat(rawIPPath); os.IsNotExist(err) {
 		return nil // 内核驱动不支持，跳过

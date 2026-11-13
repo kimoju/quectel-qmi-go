@@ -510,3 +510,52 @@ func TestNewWMSServiceWithContext_Unsupported(t *testing.T) {
 		t.Fatalf("expected ErrServiceNotSupported, got %v", err)
 	}
 }
+
+func TestParseGetSMSCAddressResponseStructuredPayload(t *testing.T) {
+	// QMI WMS_GET_SMSC_ADDRESS_RESP TLV 0x10:
+	// [address_type[3] ("145")][digits_len (14)][digits ("+8613800100500")]
+	raw := []byte{'1', '4', '5', 14, '+', '8', '6', '1', '3', '8', '0', '0', '1', '0', '0', '5', '0', '0'}
+	resp := &Packet{
+		TLVs: []TLV{
+			successResultTLV(),
+			{Type: 0x10, Value: raw},
+		},
+	}
+
+	got, err := parseGetSMSCAddressResponse(resp)
+	if err != nil {
+		t.Fatalf("parseGetSMSCAddressResponse() error = %v", err)
+	}
+	if got != "+8613800100500" {
+		t.Fatalf("parseGetSMSCAddressResponse() = %q, want %q", got, "+8613800100500")
+	}
+	if strings.Contains(got, "145") {
+		t.Fatalf("parseGetSMSCAddressResponse() leaked address_type prefix: %q", got)
+	}
+}
+
+func TestWMSServiceGetSMSCAddressParsesTLV10(t *testing.T) {
+	client := newUIMUnitTestClient()
+	raw := []byte{'1', '4', '5', 13, '+', '4', '4', '7', '8', '7', '0', '0', '0', '2', '3', '0', '8'}
+	stop := serveUIMUnitTestRequests(t, client, func(req *Packet) *Packet {
+		if req.ServiceType != ServiceWMS || req.MessageID != 0x0034 {
+			t.Fatalf("unexpected WMS request service=0x%02x msg=0x%04x", req.ServiceType, req.MessageID)
+		}
+		return &Packet{
+			TLVs: []TLV{
+				successResultTLV(),
+				{Type: 0x10, Value: raw},
+			},
+		}
+	})
+	defer stop()
+
+	wms := &WMSService{client: client, clientID: 2}
+	got, err := wms.GetSMSCAddress(context.Background())
+	if err != nil {
+		t.Fatalf("GetSMSCAddress() error = %v", err)
+	}
+	if got != "+447870002308" {
+		t.Fatalf("GetSMSCAddress() = %q, want %q", got, "+447870002308")
+	}
+}

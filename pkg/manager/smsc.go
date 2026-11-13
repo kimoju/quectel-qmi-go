@@ -48,6 +48,42 @@ func (m *Manager) GetSMSC(ctx context.Context) (string, error) {
 	return trimmed, nil
 }
 
+func (m *Manager) resolveSMSCAPDUSlot(ctx context.Context) uint8 {
+	if m == nil {
+		return smscAPDUSlot
+	}
+	m.mu.RLock()
+	hasUIM := m.uim != nil || m.client != nil || m.ensureUIMServiceHook != nil
+	m.mu.RUnlock()
+	if !hasUIM {
+		return smscAPDUSlot
+	}
+
+	details, err := withUIMRecoveryValue(m, "GetSMSC.GetCardStatusDetails", func(uim *qmi.UIMService) (*qmi.CardStatusDetails, error) {
+		d, _, err := uim.GetCardStatusDetails(ctx)
+		return d, err
+	})
+	if err == nil && details != nil {
+		if details.PrimaryGWSlot > 0 {
+			return details.PrimaryGWSlot
+		}
+		if details.ActiveSlot > 0 {
+			return details.ActiveSlot
+		}
+	}
+
+	slotInfo, slotErr := withUIMRecoveryValue(m, "GetSMSC.GetSlotStatus", func(uim *qmi.UIMService) (*qmi.UIMSlotStatus, error) {
+		return uim.GetSlotStatus(ctx)
+	})
+	if slotErr == nil {
+		if slot, ok, _ := resolveActiveUIMSlot(slotInfo); ok && slot > 0 {
+			return slot
+		}
+	}
+
+	return smscAPDUSlot
+}
+
 func (m *Manager) querySMSCFromDevice(ctx context.Context) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -63,11 +99,13 @@ func (m *Manager) querySMSCFromDevice(ctx context.Context) (string, error) {
 		}
 	}
 
+	slot := m.resolveSMSCAPDUSlot(ctx)
+
 	txBasic := func(command []byte) ([]byte, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		return m.SendAPDUContext(ctx, smscAPDUSlot, 0, command)
+		return m.SendAPDUContext(ctx, slot, 0, command)
 	}
 	smsc, errBasic := getSMSCFromUIM(txBasic)
 	if strings.TrimSpace(smsc) != "" {
@@ -77,7 +115,7 @@ func (m *Manager) querySMSCFromDevice(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	smsc, errLogical := m.getSMSCFromUIMLogicalChannel(ctx)
+	smsc, errLogical := m.getSMSCFromUIMLogicalChannel(ctx, slot)
 	if strings.TrimSpace(smsc) != "" {
 		return strings.TrimSpace(smsc), nil
 	}
@@ -172,22 +210,25 @@ func selectUSIMOrFallback(tx apduSender) error {
 	return nil
 }
 
-func (m *Manager) getSMSCFromUIMLogicalChannel(ctx context.Context) (string, error) {
-	channel, err := m.OpenLogicalChannelContext(ctx, smscAPDUSlot, genericUSIMAID)
+func (m *Manager) getSMSCFromUIMLogicalChannel(ctx context.Context, slot uint8) (string, error) {
+	if slot == 0 {
+		slot = smscAPDUSlot
+	}
+	channel, err := m.OpenLogicalChannelContext(ctx, slot, genericUSIMAID)
 	if err != nil {
 		return "", fmt.Errorf("open USIM logical channel failed: %w", err)
 	}
 	defer func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		_ = m.CloseLogicalChannelContext(closeCtx, smscAPDUSlot, channel)
+		_ = m.CloseLogicalChannelContext(closeCtx, slot, channel)
 	}()
 
 	tx := func(command []byte) ([]byte, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		return m.SendAPDUContext(ctx, smscAPDUSlot, channel, command)
+		return m.SendAPDUContext(ctx, slot, channel, command)
 	}
 	smsc, err := getSMSCFromSelectedFiles(tx)
 	if strings.TrimSpace(smsc) != "" {
@@ -575,17 +616,41 @@ func isLikelySMSC(smsc string) bool {
 	return true
 }
 
+func parseBERTLVLength(buf []byte, offset int) (length int, nextOffset int, ok bool) {
+	if offset < 0 || offset >= len(buf) {
+		return 0, 0, false
+	}
+	first := buf[offset]
+	offset++
+	if first&0x80 == 0 {
+		return int(first), offset, true
+	}
+	numOctets := int(first & 0x7F)
+	// ISO/IEC 8825-1 definite long form: 0x81 (1 byte), 0x82 (2 bytes), up to 4 bytes; 0x80 (indefinite) is invalid here.
+	if numOctets <= 0 || numOctets > 4 || offset+numOctets > len(buf) {
+		return 0, 0, false
+	}
+	val := 0
+	for j := 0; j < numOctets; j++ {
+		val = (val << 8) | int(buf[offset+j])
+	}
+	return val, offset + numOctets, true
+}
+
 func parseLinearFixedMetaFromFCP(fcp []byte) (recordLen int, recordCount int) {
 	if len(fcp) < 2 {
 		return 0, 0
 	}
 	data := fcp
 	if fcp[0] == 0x62 {
-		total := int(fcp[1])
-		if total > len(fcp)-2 {
-			total = len(fcp) - 2
+		total, hdrEnd, ok := parseBERTLVLength(fcp, 1)
+		if !ok {
+			return 0, 0
 		}
-		data = fcp[2 : 2+total]
+		if total > len(fcp)-hdrEnd {
+			total = len(fcp) - hdrEnd
+		}
+		data = fcp[hdrEnd : hdrEnd+total]
 	}
 
 	for i := 0; i < len(data); {
@@ -594,19 +659,11 @@ func parseLinearFixedMetaFromFCP(fcp []byte) (recordLen int, recordCount int) {
 		}
 		tag := data[i]
 		i++
-		l := int(data[i])
-		i++
-		if l&0x80 != 0 {
-			n := l & 0x7F
-			if n <= 0 || i+n > len(data) {
-				break
-			}
-			l = 0
-			for j := 0; j < n; j++ {
-				l = (l << 8) | int(data[i+j])
-			}
-			i += n
+		l, nextIdx, ok := parseBERTLVLength(data, i)
+		if !ok {
+			break
 		}
+		i = nextIdx
 		if i+l > len(data) {
 			break
 		}
