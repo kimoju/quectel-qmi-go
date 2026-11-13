@@ -1,6 +1,9 @@
 package netcfg
 
-import "net"
+import (
+	"net"
+	"sync"
+)
 
 // NetworkConfigurator defines the interface for OS-specific network operations
 // NetworkConfigurator 定义了特定于操作系统的网络操作接口
@@ -41,8 +44,8 @@ type NetworkConfigurator interface {
 	// SetMTU 设置接口的 MTU
 	SetMTU(ifname string, mtu int) error
 
-	// GetCurrentIP returns the current IPv4 address of the interface
-	// GetCurrentIP 返回接口当前的 IPv4 地址
+	// GetCurrentIP returns the current global IP address of the interface (IPv4 preferred, IPv6 fallback)
+	// GetCurrentIP 返回接口当前的全局 IP 地址
 	GetCurrentIP(ifname string) (net.IP, error)
 
 	// IsUp checks if the interface is up
@@ -70,17 +73,48 @@ type NetworkConfigurator interface {
 	EnableRawIP(ifname string) error
 }
 
-var currentConfigurator NetworkConfigurator
+// MultiIPConfigurator is an optional extension implemented by configurators
+// that can return all global IPv4 and IPv6 addresses on an interface.
+type MultiIPConfigurator interface {
+	GetCurrentIPs(ifname string) ([]net.IP, error)
+}
+
+// MultiDNSConfigurator is an optional extension implemented by configurators
+// that can configure more than two DNS servers (e.g., dual-stack IPv4 + IPv6 DNS).
+type MultiDNSConfigurator interface {
+	UpdateDNSServers(servers ...string) error
+}
+
+var (
+	configuratorMu      sync.RWMutex
+	currentConfigurator NetworkConfigurator
+)
 
 // SetConfigurator sets the active network configurator
 // SetConfigurator 设置活动的网络配置器
 func SetConfigurator(c NetworkConfigurator) {
+	configuratorMu.Lock()
 	currentConfigurator = c
+	configuratorMu.Unlock()
+}
+
+// ResetConfigurator clears the active network configurator so platform detection runs again.
+func ResetConfigurator() {
+	SetConfigurator(nil)
 }
 
 // GetConfigurator returns the active network configurator
 // GetConfigurator 返回活动的网络配置器
 func GetConfigurator() NetworkConfigurator {
+	configuratorMu.RLock()
+	c := currentConfigurator
+	configuratorMu.RUnlock()
+	if c != nil {
+		return c
+	}
+
+	configuratorMu.Lock()
+	defer configuratorMu.Unlock()
 	if currentConfigurator == nil {
 		// Auto-detect platform implementation / 自动检测平台实现
 		currentConfigurator = GetPlatformConfigurator()

@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/kimoju/quectel-qmi-go/pkg/device"
 	"github.com/kimoju/quectel-qmi-go/pkg/manager"
+	"github.com/kimoju/quectel-qmi-go/pkg/qmi"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -46,7 +48,47 @@ var (
 
 const Version = "1.0.0"
 
+func resolveIPFamilies(ipv4Flag, ipv6Flag bool) (enableV4, enableV6 bool) {
+	switch {
+	case ipv4Flag && ipv6Flag:
+		return true, true
+	case ipv4Flag:
+		return true, false
+	case ipv6Flag:
+		return false, true
+	default:
+		return true, true
+	}
+}
+
+func formatConnectedIPs(settings *qmi.RuntimeSettings) string {
+	if settings == nil {
+		return "none"
+	}
+	parts := make([]string, 0, 2)
+	if len(settings.IPv4Address) > 0 {
+		parts = append(parts, fmt.Sprintf("IPv4=%s", settings.IPv4Address))
+	}
+	if len(settings.IPv6Address) > 0 {
+		if settings.IPv6Prefix > 0 {
+			parts = append(parts, fmt.Sprintf("IPv6=%s/%d", settings.IPv6Address, settings.IPv6Prefix))
+		} else {
+			parts = append(parts, fmt.Sprintf("IPv6=%s", settings.IPv6Address))
+		}
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, ", ")
+}
+
 func main() {
+	if code := run(); code != 0 {
+		os.Exit(code)
+	}
+}
+
+func run() int {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Quectel-CM Go Edition v%s\n", Version)
 		fmt.Fprintf(os.Stderr, "A pure Go implementation of the Quectel Connection Manager\n\n")
@@ -62,7 +104,7 @@ func main() {
 
 	if *version {
 		fmt.Printf("quectel-qmi-go version %s\n", Version)
-		os.Exit(0)
+		return 0
 	}
 
 	// Setup logger / 设置日志记录器
@@ -70,7 +112,6 @@ func main() {
 	config.EncoderConfig.EncodeTime = zapcore.TimeEncoderOfLayout("[2006-01-02 15:04:05]")
 	config.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
 	config.DisableStacktrace = true // Keep it clean for normal usage
-	// config.DisableCaller = true     // Hide caller (line number) for compactness
 
 	if *verbose {
 		config.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
@@ -80,20 +121,24 @@ func main() {
 
 	zapLog, err := config.Build()
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
+		return 1
 	}
-	defer zapLog.Sync()
+	defer func() { _ = zapLog.Sync() }()
 
-	// Use SugaredLogger for convenience (printf style)
 	log := zapLog.Sugar()
-
 	log.Infof("Quectel-CM Go Edition v%s", Version)
 
 	// Discover modems / 发现modem设备
 	log.Info("Discovering modems...")
 	modems, err := device.Discover()
 	if err != nil {
-		log.Fatal("Failed to discover modems: ", err)
+		log.Errorf("Failed to discover modems: %v", err)
+		return 1
+	}
+	if len(modems) == 0 {
+		log.Error("No QMI modems discovered")
+		return 1
 	}
 
 	// Select modem / 选择modem
@@ -108,7 +153,8 @@ func main() {
 			}
 		}
 		if selectedModem.ControlPath == "" {
-			log.Fatal("Specified modem not found")
+			log.Error("Specified modem not found")
+			return 1
 		}
 	} else {
 		// Use first modem / 使用第一个发现的modem
@@ -118,12 +164,7 @@ func main() {
 	log.Infof("Using modem: %s", selectedModem)
 
 	// Determine IP versions / 确定IP版本
-	enableV4 := !*ipv6Only
-	enableV6 := !*ipv4Only
-	if *ipv6Only {
-		enableV4 = false
-		enableV6 = true
-	}
+	enableV4, enableV6 := resolveIPFamilies(*ipv4Only, *ipv6Only)
 
 	// Create manager config / 创建管理器配置
 	cfg := manager.Config{
@@ -143,16 +184,18 @@ func main() {
 	}
 
 	// Create and start manager / 创建并启动管理器
-	// Wrap zap logger for manager
 	mgrLogger := manager.NewZapLogger(zapLog)
 	mgr := manager.New(cfg, mgrLogger)
 	if err := mgr.Start(); err != nil {
-		log.Fatal("Failed to start connection manager: ", err)
+		log.Errorf("Failed to start connection manager: %v", err)
+		return 1
 	}
+	defer func() { _ = mgr.Stop() }()
 
 	// Setup signal handlers / 设置信号处理
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
 	// Status display ticker / 状态显示定时器
 	statusTicker := time.NewTicker(30 * time.Second)
@@ -165,15 +208,15 @@ func main() {
 		select {
 		case sig := <-sigCh:
 			log.Infof("Received signal %v, shutting down...", sig)
-			mgr.Stop()
+			_ = mgr.Stop()
 			log.Info("Goodbye!")
-			os.Exit(0)
+			return 0
 
 		case <-statusTicker.C:
 			state := mgr.State()
 			settings := mgr.Settings()
 			if state == manager.StateConnected && settings != nil {
-				log.Infof("Status: %s | IP: %s", state, settings.IPv4Address)
+				log.Infof("Status: %s | %s", state, formatConnectedIPs(settings))
 			} else {
 				log.Infof("Status: %s", state)
 			}

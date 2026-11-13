@@ -1,10 +1,16 @@
+//go:build linux
+
 package netcfg
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/kimoju/netlink"
 )
 
 func mkdirAllWrite(t *testing.T, path, content string) {
@@ -153,5 +159,137 @@ func TestUpdateAndRestoreDNSPreservesUnmanagedNameservers(t *testing.T) {
 	}
 	if !strings.Contains(restored, "search corp.local") || !strings.Contains(restored, "options edns0") {
 		t.Fatalf("RestoreDNS() lost non-nameserver directives:\n%s", restored)
+	}
+}
+
+// MEDIUM-5 & HIGH-2: UpdateDNSServers preserves /etc/resolv.conf symlinks, writes IPv4+IPv6 DNS servers,
+// serializes concurrent multi-instance updates via package-level resolvConfMu, and restores cleanly.
+func TestMedium5AndHigh2SymlinkPreservingDualStackDNSAndConcurrency(t *testing.T) {
+	dir := t.TempDir()
+	realTarget := filepath.Join(dir, "run", "systemd", "resolve", "resolv.conf")
+	mkdirAllWrite(t, realTarget, "nameserver 192.168.1.1\n")
+
+	symlinkPath := filepath.Join(dir, "etc", "resolv.conf")
+	if err := os.MkdirAll(filepath.Dir(symlinkPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realTarget, symlinkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg1 := &LinuxConfigurator{resolvConfPath: symlinkPath}
+	cfg2 := &LinuxConfigurator{resolvConfPath: symlinkPath}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = cfg1.UpdateDNSServers("1.1.1.1", "2409:8088::1")
+		}()
+		go func() {
+			defer wg.Done()
+			_ = cfg2.UpdateDNSServers("8.8.8.8", "2409:8088::2")
+		}()
+	}
+	wg.Wait()
+
+	if err := cfg1.UpdateDNSServers("1.1.1.1", "8.8.8.8", "2409:8088::1", "2409:8088::2"); err != nil {
+		t.Fatalf("UpdateDNSServers() error = %v", err)
+	}
+
+	// Verify symlinkPath is STILL a symlink (never replaced by a regular file)!
+	fi, err := os.Lstat(symlinkPath)
+	if err != nil {
+		t.Fatalf("Lstat(%s) error = %v", symlinkPath, err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("UpdateDNSServers() destroyed symlink at %s (mode=%v)", symlinkPath, fi.Mode())
+	}
+
+	targetBytes, err := os.ReadFile(realTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(targetBytes)
+	for _, want := range []string{
+		"nameserver 1.1.1.1",
+		"nameserver 8.8.8.8",
+		"nameserver 2409:8088::1",
+		"nameserver 2409:8088::2",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("symlink target missing %q:\n%s", want, content)
+		}
+	}
+
+	if err := cfg1.RestoreDNS(); err != nil {
+		t.Fatalf("RestoreDNS() error = %v", err)
+	}
+	restoredBytes, err := os.ReadFile(realTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(restoredBytes), "nameserver 192.168.1.1") || strings.Contains(string(restoredBytes), "2409:8088::1") {
+		t.Fatalf("unexpected restored resolv.conf:\n%s", string(restoredBytes))
+	}
+}
+
+// HIGH-10 & MEDIUM-5: selectGlobalInterfaceIPs supports IPv6-only & dual-stack interfaces,
+// and buildGatewayDefaultRoute / buildDirectDefaultRoute use unified RouteMetric + FLAG_ONLINK for off-subnet cellular gateways.
+func TestHigh10LinuxIPv6GlobalAddressDiscoveryAndOnlinkDefaultRoutes(t *testing.T) {
+	mkAddr := func(cidr string) netlink.Addr {
+		ip, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			t.Fatalf("ParseCIDR(%s): %v", cidr, err)
+		}
+		ipNet.IP = ip
+		return netlink.Addr{IPNet: ipNet}
+	}
+
+	// IPv6-only interface (link-local + global IPv6): must skip fe80:: and return global IPv6!
+	v6OnlyAddrs := []netlink.Addr{
+		mkAddr("fe80::1234/64"),
+		mkAddr("2409:8900:1234::1/64"),
+	}
+	gotV6Only := selectGlobalInterfaceIPs(v6OnlyAddrs)
+	if len(gotV6Only) != 1 || !gotV6Only[0].Equal(net.ParseIP("2409:8900:1234::1")) {
+		t.Fatalf("selectGlobalInterfaceIPs(IPv6-only) = %v, want [2409:8900:1234::1]", gotV6Only)
+	}
+
+	// Dual-stack interface: IPv4 first, then global IPv6.
+	dualAddrs := []netlink.Addr{
+		mkAddr("fe80::1/64"),
+		mkAddr("2409:8900:1234::2/64"),
+		mkAddr("10.64.0.2/32"),
+	}
+	gotDual := selectGlobalInterfaceIPs(dualAddrs)
+	if len(gotDual) != 2 || !gotDual[0].Equal(net.ParseIP("10.64.0.2")) || !gotDual[1].Equal(net.ParseIP("2409:8900:1234::2")) {
+		t.Fatalf("selectGlobalInterfaceIPs(dual-stack) = %v, want [10.64.0.2, 2409:8900:1234::2]", gotDual)
+	}
+
+	cfg := NewLinuxConfigurator()
+	// Off-subnet IPv4 cellular gateway (/32 PtP): FLAG_ONLINK + unified metric 512.
+	r4 := buildGatewayDefaultRoute(7, net.ParseIP("10.64.0.1"), cfg.routeMetric())
+	if r4.Priority != defaultRouteMetric || r4.Flags&int(netlink.FLAG_ONLINK) == 0 || r4.Dst.String() != "0.0.0.0/0" {
+		t.Fatalf("IPv4 gateway route = %+v, want Priority=%d FLAG_ONLINK Dst=0.0.0.0/0", r4, defaultRouteMetric)
+	}
+
+	// Global IPv6 cellular gateway: FLAG_ONLINK + ::/0 + unified metric 512.
+	r6Global := buildGatewayDefaultRoute(7, net.ParseIP("2409:8900:1234::1"), cfg.routeMetric())
+	if r6Global.Priority != defaultRouteMetric || r6Global.Flags&int(netlink.FLAG_ONLINK) == 0 || r6Global.Dst.String() != "::/0" {
+		t.Fatalf("IPv6 global gateway route = %+v, want Priority=%d FLAG_ONLINK Dst=::/0", r6Global, defaultRouteMetric)
+	}
+
+	// Link-local IPv6 gateway (fe80::1): NO FLAG_ONLINK needed, Dst=::/0.
+	r6LL := buildGatewayDefaultRoute(7, net.ParseIP("fe80::1"), cfg.routeMetric())
+	if r6LL.Flags&int(netlink.FLAG_ONLINK) != 0 || r6LL.Dst.String() != "::/0" {
+		t.Fatalf("IPv6 link-local gateway route = %+v, want Flags=0 Dst=::/0", r6LL)
+	}
+
+	// Direct route uses identical Priority as gateway route!
+	rDirect := buildDirectDefaultRoute(7, true, cfg.routeMetric())
+	if rDirect.Priority != r4.Priority || rDirect.Dst.String() != "::/0" {
+		t.Fatalf("direct IPv6 route = %+v, want Priority=%d Dst=::/0", rDirect, r4.Priority)
 	}
 }

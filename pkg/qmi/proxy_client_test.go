@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-func TestClientProxyOpenRunsBeforeInitialSync(t *testing.T) {
+func TestClientProxyOpenNeverSendsInitialSync(t *testing.T) {
 	const devicePath = "/dev/cdc-wdm-test0"
 
 	errCh := withProxyTransportForTest(t, func(conn net.Conn) error {
@@ -35,20 +35,19 @@ func TestClientProxyOpenRunsBeforeInitialSync(t *testing.T) {
 			return err
 		}
 
-		syncReq, err := readQMIFrameFromConn(conn)
-		if err != nil {
-			return err
+		// Ensure CTLSync (0x0027) is NEVER sent over qmi-proxy, even if SyncOnOpen: true is passed.
+		_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		extra, err := readQMIFrameFromConn(conn)
+		if err == nil && extra != nil {
+			return fmt.Errorf("unexpected frame after proxy open: service=0x%02x msg=0x%04x", extra.ServiceType, extra.MessageID)
 		}
-		if err := assertCTLRequest(syncReq, 0x0027); err != nil {
-			return err
-		}
-		return writeCTLSuccess(conn, syncReq)
+		return nil
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	client, err := NewClientWithOptions(ctx, devicePath, ClientOptions{UseProxy: true})
+	client, err := NewClientWithOptions(ctx, devicePath, ClientOptions{UseProxy: true, SyncOnOpen: true})
 	if err != nil {
 		t.Fatalf("NewClientWithOptions() error = %v", err)
 	}

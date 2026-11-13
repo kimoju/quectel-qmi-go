@@ -12,13 +12,20 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Printf("%v", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	devicePath := flag.String("device", defaultQmiDevice(), "Path to QMI device")
 	action := flag.String("action", "all", "Action: all, serving, signal, signal-info, sysinfo, scan, register, dump")
 	flag.Parse()
 
 	client, err := qmi.NewClientWithOptions(context.Background(), *devicePath, qmi.ClientOptions{})
 	if err != nil {
-		log.Fatalf("Failed to create QMI client: %v", err)
+		return fmt.Errorf("failed to create QMI client: %w", err)
 	}
 	defer client.Close()
 
@@ -27,7 +34,7 @@ func main() {
 
 	nas, err := qmi.NewNASService(client)
 	if err != nil {
-		log.Fatalf("Failed to create NAS service: %v", err)
+		return fmt.Errorf("failed to create NAS service: %w", err)
 	}
 	defer nas.Close()
 
@@ -54,8 +61,9 @@ func main() {
 	case "dump":
 		runDump(ctx, client, nas)
 	default:
-		log.Fatalf("Unknown action: %s", *action)
+		return fmt.Errorf("unknown action: %s", *action)
 	}
+	return nil
 }
 
 func runRegister(nas *qmi.NASService) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,10 +18,13 @@ import (
 // ModemPool manages multiple modem connections / ModemPool 管理多个模组连接
 type ModemPool struct {
 	mu       sync.RWMutex
-	modems   map[string]*Manager // key = interface name (e.g. "wwan0") / key = 接口名
+	modems   map[string]*Manager // key = interface name (e.g. "wwan0") or control/USB path fallback
 	selector Selector            // Load balancing strategy / 负载均衡策略
 	log      Logger
 	events   *EventEmitter
+
+	poolEventsMu      sync.RWMutex
+	poolEventHandlers []PoolEventHandler
 
 	// Health monitoring / 健康监控
 	healthCtx    context.Context
@@ -32,6 +36,26 @@ type ModemPool struct {
 	hotplugCancel context.CancelFunc
 	baseCfg       Config // Base config for auto-discovered modems / 自动发现模组的基础配置
 	baseLogger    Logger // Logger for auto-discovered modems / 自动发现模组的日志器
+}
+
+func modemPoolKey(dev ModemDevice) string {
+	if iface := strings.TrimSpace(dev.NetInterface); iface != "" {
+		return iface
+	}
+	if ctrl := strings.TrimSpace(dev.ControlPath); ctrl != "" {
+		return ctrl
+	}
+	return strings.TrimSpace(dev.USBPath)
+}
+
+func (p *ModemPool) logger() Logger {
+	p.mu.RLock()
+	l := p.log
+	p.mu.RUnlock()
+	if l == nil {
+		return NewNopLogger()
+	}
+	return l
 }
 
 // HealthStatus represents the health of a modem / HealthStatus 表示模组的健康状态
@@ -56,7 +80,12 @@ func NewPool() *ModemPool {
 
 // SetLogger sets the logger for the pool / SetLogger 设置池的日志器
 func (p *ModemPool) SetLogger(logger Logger) {
+	if logger == nil {
+		logger = NewNopLogger()
+	}
+	p.mu.Lock()
 	p.log = logger.WithField("component", "pool")
+	p.mu.Unlock()
 }
 
 // SetSelector sets the modem selection strategy / SetSelector 设置模组选择策略
@@ -98,7 +127,7 @@ func (p *ModemPool) Remove(name string) error {
 	p.mu.Unlock()
 
 	_ = mgr.Stop()
-	p.log.Infof("Removed modem: %s", name)
+	p.logger().Infof("Removed modem: %s", name)
 	return nil
 }
 
@@ -229,8 +258,11 @@ func (p *ModemPool) StartAll() error {
 	return nil
 }
 
-// StopAll stops all modems / StopAll 停止所有模组
+// StopAll stops background monitors and all modems / StopAll 停止后台监控及所有模组
 func (p *ModemPool) StopAll() {
+	p.StopHotPlug()
+	p.StopHealthMonitor()
+
 	p.mu.RLock()
 	modems := make([]*Manager, 0, len(p.modems))
 	for _, mgr := range p.modems {
@@ -243,7 +275,7 @@ func (p *ModemPool) StopAll() {
 		wg.Add(1)
 		go func(m *Manager) {
 			defer wg.Done()
-			m.Stop()
+			_ = m.Stop()
 		}(mgr)
 	}
 	wg.Wait()
@@ -255,22 +287,28 @@ func (p *ModemPool) StopAll() {
 
 // DiscoverAndAdd discovers modems and adds them to pool / DiscoverAndAdd 发现模组并添加到池
 func (p *ModemPool) DiscoverAndAdd(baseCfg Config, logger Logger) (int, error) {
-	if discoverModemsFn == nil {
+	discoverFn := getDeviceDiscoverer()
+	if discoverFn == nil {
 		return 0, fmt.Errorf("no device discoverer registered; import github.com/kimoju/quectel-qmi-go/pkg/device or inject devices manually")
 	}
-	modems, err := discoverModemsFn()
+	modems, err := discoverFn()
 	if err != nil {
 		return 0, err
 	}
 
 	added := 0
 	for _, modem := range modems {
+		key := modemPoolKey(modem)
+		if key == "" {
+			p.logger().Warn("Skipping discovered modem with empty identifier")
+			continue
+		}
 		cfg := baseCfg
 		cfg.Device = modem
 
-		_, err := p.Add(modem.NetInterface, cfg, logger)
+		_, err := p.Add(key, cfg, logger)
 		if err != nil {
-			p.log.WithError(err).Warnf("Failed to add modem %s", modem.NetInterface)
+			p.logger().WithError(err).Warnf("Failed to add modem %s", key)
 			continue
 		}
 		added++
@@ -296,7 +334,7 @@ func (p *ModemPool) StartHealthMonitor(interval time.Duration) {
 	p.mu.Unlock()
 
 	go p.healthLoop(ctx, interval)
-	p.log.Infof("Health monitor started (interval=%s)", interval)
+	p.logger().Infof("Health monitor started (interval=%s)", interval)
 }
 
 // StopHealthMonitor stops the health monitor / StopHealthMonitor 停止健康监控
@@ -309,7 +347,7 @@ func (p *ModemPool) StopHealthMonitor() {
 
 	if cancel != nil {
 		cancel()
-		p.log.Info("Health monitor stopped")
+		p.logger().Info("Health monitor stopped")
 	}
 }
 
@@ -333,9 +371,10 @@ func queryManagerSignalRSSI(parentCtx context.Context, mgr *Manager) (int8, bool
 	}
 	mgr.mu.RLock()
 	nas := mgr.nas
+	hook := mgr.querySignalStrength
 	timeout := mgr.cfg.Timeouts.StatusCheck
 	mgr.mu.RUnlock()
-	if nas == nil {
+	if nas == nil && hook == nil {
 		return 0, false, nil
 	}
 	if parentCtx == nil {
@@ -346,6 +385,16 @@ func queryManagerSignalRSSI(parentCtx context.Context, mgr *Manager) (int8, bool
 	}
 	ctx, cancel := context.WithTimeout(parentCtx, timeout)
 	defer cancel()
+	if hook != nil {
+		sig, err := hook(ctx)
+		if err != nil {
+			return 0, true, err
+		}
+		if sig == nil {
+			return 0, false, nil
+		}
+		return sig.RSSI, true, nil
+	}
 	sig, err := nas.GetSignalStrength(ctx)
 	if err != nil {
 		return 0, true, err
@@ -447,7 +496,7 @@ func (p *ModemPool) WatchHotPlug(baseCfg Config, logger Logger, interval time.Du
 	p.mu.Unlock()
 
 	go p.hotplugLoop(ctx, interval)
-	p.log.Infof("Hot-plug watcher started (interval=%s)", interval)
+	p.logger().Infof("Hot-plug watcher started (interval=%s)", interval)
 }
 
 // StopHotPlug stops watching for hot-plug events / StopHotPlug 停止监控热插拔
@@ -460,7 +509,7 @@ func (p *ModemPool) StopHotPlug() {
 
 	if cancel != nil {
 		cancel()
-		p.log.Info("Hot-plug watcher stopped")
+		p.logger().Info("Hot-plug watcher stopped")
 	}
 }
 
@@ -479,63 +528,85 @@ func (p *ModemPool) hotplugLoop(ctx context.Context, interval time.Duration) {
 }
 
 func (p *ModemPool) scanForChanges() {
-	if discoverModemsFn == nil {
-		p.log.Debug("Hot-plug scan skipped: no device discoverer registered")
+	discoverFn := getDeviceDiscoverer()
+	if discoverFn == nil {
+		p.logger().Debug("Hot-plug scan skipped: no device discoverer registered")
 		return
 	}
 	// Discover currently available modems / 发现当前可用的模组
-	discovered, err := discoverModemsFn()
+	discovered, err := discoverFn()
 	if err != nil {
-		p.log.WithError(err).Debug("Hot-plug scan failed")
+		p.logger().WithError(err).Debug("Hot-plug scan failed")
 		return
 	}
 
-	discoveredMap := make(map[string]ModemDevice)
+	discoveredMap := make(map[string]ModemDevice, len(discovered))
 	for _, m := range discovered {
-		discoveredMap[m.NetInterface] = m
+		key := modemPoolKey(m)
+		if key == "" {
+			continue
+		}
+		discoveredMap[key] = m
 	}
 
-	type removedEntry struct {
+	type poolEntry struct {
 		name string
 		mgr  *Manager
 	}
-	var removed []removedEntry
-	var added []*Manager
+	var removed []poolEntry
+	var added []poolEntry
 
 	p.mu.Lock()
 	for name, mgr := range p.modems {
 		if _, exists := discoveredMap[name]; !exists {
-			removed = append(removed, removedEntry{name: name, mgr: mgr})
+			removed = append(removed, poolEntry{name: name, mgr: mgr})
 			delete(p.modems, name)
 			delete(p.healthStatus, name)
 		}
 	}
 	baseCfg := p.baseCfg
 	baseLogger := p.baseLogger
+	poolLog := p.log
+	p.mu.Unlock()
+	if poolLog == nil {
+		poolLog = NewNopLogger()
+	}
+
+	p.mu.Lock()
 	for name, dev := range discoveredMap {
 		if _, exists := p.modems[name]; !exists {
-			p.log.Infof("Hot-plug: new modem %s detected", name)
+			poolLog.Infof("Hot-plug: new modem %s detected", name)
 			cfg := baseCfg
 			cfg.Device = dev
 			mgr := New(cfg, baseLogger)
 			p.modems[name] = mgr
-			added = append(added, mgr)
+			added = append(added, poolEntry{name: name, mgr: mgr})
 		}
 	}
 	p.mu.Unlock()
 
 	for _, item := range removed {
-		p.log.Warnf("Hot-plug: modem %s removed", item.name)
+		p.logger().Warnf("Hot-plug: modem %s removed", item.name)
 		_ = item.mgr.Stop()
 		p.events.Emit(Event{Type: EventDisconnected})
+		p.emitPoolEvent(PoolEvent{
+			Type:  PoolEventModemRemoved,
+			Name:  item.name,
+			Modem: item.mgr,
+		})
 	}
 
-	for _, mgr := range added {
+	for _, item := range added {
+		p.emitPoolEvent(PoolEvent{
+			Type:  PoolEventModemAdded,
+			Name:  item.name,
+			Modem: item.mgr,
+		})
 		go func(m *Manager) {
 			if err := m.Start(); err != nil {
-				p.log.WithError(err).Warnf("Failed to start hot-plugged modem")
+				p.logger().WithError(err).Warnf("Failed to start hot-plugged modem")
 			}
-		}(mgr)
+		}(item.mgr)
 	}
 }
 
@@ -543,9 +614,28 @@ func (p *ModemPool) scanForChanges() {
 // 事件
 // ============================================================================
 
-// OnEvent registers a callback for pool events / OnEvent 为池事件注册回调
+// OnEvent registers a callback for manager-style events / OnEvent 为事件注册回调
 func (p *ModemPool) OnEvent(handler EventHandler) {
 	p.events.On(handler)
+}
+
+// OnPoolEvent registers a callback for pool-level hot-plug events (added/removed).
+func (p *ModemPool) OnPoolEvent(handler PoolEventHandler) {
+	if handler == nil {
+		return
+	}
+	p.poolEventsMu.Lock()
+	p.poolEventHandlers = append(p.poolEventHandlers, handler)
+	p.poolEventsMu.Unlock()
+}
+
+func (p *ModemPool) emitPoolEvent(event PoolEvent) {
+	p.poolEventsMu.RLock()
+	handlers := append([]PoolEventHandler(nil), p.poolEventHandlers...)
+	p.poolEventsMu.RUnlock()
+	for _, h := range handlers {
+		h(event)
+	}
 }
 
 // ============================================================================
@@ -596,17 +686,23 @@ func (s *RandomSelector) Select(modems []*Manager) *Manager {
 // SignalStrengthSelector selects the modem with best signal / SignalStrengthSelector 选择信号最强的模组
 type SignalStrengthSelector struct{}
 
+func isValidCellularRSSI(rssi int8) bool {
+	// Valid cellular RSSI in dBm is strictly negative (typically -125..-30 dBm).
+	// Reject 0 (unmeasured default) and positive values like +125 (0x7D QMI unknown sentinel).
+	return rssi < 0 && rssi >= -125
+}
+
 func (s *SignalStrengthSelector) Select(modems []*Manager) *Manager {
 	if len(modems) == 0 {
 		return nil
 	}
 
 	var best *Manager
-	bestRSSI := int8(-128) // Minimum possible value / 最小可能值
+	bestRSSI := int8(-128)
 
 	for _, mgr := range modems {
 		rssi, attempted, err := queryManagerSignalRSSI(context.Background(), mgr)
-		if attempted && err == nil && rssi > bestRSSI {
+		if attempted && err == nil && isValidCellularRSSI(rssi) && (best == nil || rssi > bestRSSI) {
 			bestRSSI = rssi
 			best = mgr
 		}
@@ -642,6 +738,20 @@ func (s *LeastUsedSelector) Select(modems []*Manager) *Manager {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.lastUsed == nil {
+		s.lastUsed = make(map[*Manager]time.Time, len(modems))
+	}
+
+	// Prune stale *Manager keys from hot-unplugged modems so map does not leak.
+	active := make(map[*Manager]struct{}, len(modems))
+	for _, mgr := range modems {
+		active[mgr] = struct{}{}
+	}
+	for mgr := range s.lastUsed {
+		if _, ok := active[mgr]; !ok {
+			delete(s.lastUsed, mgr)
+		}
+	}
 
 	var leastUsed *Manager
 	var leastTime time.Time

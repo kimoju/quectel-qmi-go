@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -413,8 +414,13 @@ type NASInitiateNetworkRegisterRequest struct {
 }
 
 type NASOperatorNameInfo struct {
-	ServiceProviderName string
-	OperatorStringName  string
+	ServiceProviderName    string
+	SPNDisplayCondition    uint8
+	HasSPNDisplayCondition bool
+	OperatorStringName     string
+	NITZOperatorName       string
+	PLMNLongName           string
+	PLMNShortName          string
 }
 
 type NASPLMNNameRequest struct {
@@ -424,25 +430,35 @@ type NASPLMNNameRequest struct {
 }
 
 type NASPLMNNameInfo struct {
-	LongName  string
-	ShortName string
+	ServiceProviderName string
+	LongName            string
+	ShortName           string
 }
 
 type NASSignalInfoConfigV2 struct {
-	LTEEnabled    bool
-	LTERSRPDelta  uint8
-	LTERSRQDelta  uint8
-	LTESNRDelta   uint8
-	NR5GEnabled   bool
-	NR5GRSRPDelta uint8
-	NR5GRSRQDelta uint8
-	NR5GSINRDelta uint8
+	LTEEnabled              bool
+	LTERSRPDelta            uint8
+	LTERSRQDelta            uint8
+	LTESNRDelta             uint8
+	LTEReportRate           uint8
+	LTEReportAveragePeriod  uint8
+	HasLTEReport            bool
+	NR5GEnabled             bool
+	NR5GRSRPDelta           uint8
+	NR5GRSRQDelta           uint8
+	NR5GSINRDelta           uint8
+	NR5GReportRate          uint8
+	NR5GReportAveragePeriod uint8
+	HasNR5GReport           bool
 }
 
 type NASNetworkRejectInfo struct {
 	RadioInterface uint8
+	ServiceDomain  uint8
 	RejectCause    uint32
 	PLMN           string
+	CSGID          uint32
+	HasCSGID       bool
 }
 
 type NASIncrementalNetworkScanInfo struct {
@@ -789,52 +805,128 @@ func (n *NASService) GetPLMNName(ctx context.Context, req NASPLMNNameRequest) (*
 	if err != nil {
 		return nil, err
 	}
+	return parsePLMNNameResponse(resp)
+}
+
+func parsePLMNNameResponse(resp *Packet) (*NASPLMNNameInfo, error) {
+	if resp == nil {
+		return nil, fmt.Errorf("get plmn name response is nil")
+	}
 	if err := resp.CheckResult(); err != nil {
 		return nil, fmt.Errorf("get plmn name failed: %w", err)
 	}
 	info := &NASPLMNNameInfo{}
-	if tlv := FindTLV(resp.TLVs, 0x10); tlv != nil && len(tlv.Value) >= 1 {
-		longLen := int(tlv.Value[0])
-		if len(tlv.Value) >= 1+longLen {
-			info.LongName = string(tlv.Value[1 : 1+longLen])
+	// QMI_NAS_GET_PLMN_NAME (0x0044) TLV 0x10 ("3GPP EONS PLMN Name"):
+	// [spn_enc(1), spn_len(1), spn(spn_len),
+	//  short_enc(1), short_ci(1), short_spare(1), short_len(1), short_name(short_len),
+	//  long_enc(1), long_ci(1), long_spare(1), long_len(1), long_name(long_len)]
+	if tlv := FindTLV(resp.TLVs, 0x10); tlv != nil && len(tlv.Value) >= 2 {
+		val := tlv.Value
+		offset := 0
+
+		spnEnc := val[offset]
+		spnLen := int(val[offset+1])
+		offset += 2
+		if spnLen > len(val)-offset {
+			spnLen = len(val) - offset
 		}
-	}
-	if tlv := FindTLV(resp.TLVs, 0x11); tlv != nil && len(tlv.Value) >= 1 {
-		shortLen := int(tlv.Value[0])
-		if len(tlv.Value) >= 1+shortLen {
-			info.ShortName = string(tlv.Value[1 : 1+shortLen])
+		spnBytes := val[offset : offset+spnLen]
+		offset += spnLen
+		info.ServiceProviderName = decodeNASEncodedName(spnEnc, -1, spnBytes)
+
+		if len(val)-offset >= 4 {
+			shortEnc := val[offset]
+			shortSpare := int(val[offset+2])
+			shortLen := int(val[offset+3])
+			offset += 4
+			if shortLen > len(val)-offset {
+				shortLen = len(val) - offset
+			}
+			shortBytes := val[offset : offset+shortLen]
+			offset += shortLen
+			info.ShortName = decodeNASEncodedName(shortEnc, shortSpare, shortBytes)
+		}
+
+		if len(val)-offset >= 4 {
+			longEnc := val[offset]
+			longSpare := int(val[offset+2])
+			longLen := int(val[offset+3])
+			offset += 4
+			if longLen > len(val)-offset {
+				longLen = len(val) - offset
+			}
+			longBytes := val[offset : offset+longLen]
+			info.LongName = decodeNASEncodedName(longEnc, longSpare, longBytes)
 		}
 	}
 	return info, nil
 }
 
-// ConfigSignalInfoV2 sets signal-info indication reporting behavior.
-func (n *NASService) ConfigSignalInfoV2(ctx context.Context, cfg NASSignalInfoConfigV2) error {
-	tlvs := make([]TLV, 0, 2)
+func buildConfigSignalInfoV2TLVs(cfg NASSignalInfoConfigV2) ([]TLV, error) {
+	// Verified against libqmi-glib.so.5 (qmi_client_nas_config_signal_info_v2):
+	// QMI_NAS_CONFIG_SIGNAL_INFO_V2 (0x006C) wire TLV IDs (deltas in 0.1 dB / 0.1 dBm uint16 units):
+	//   0x25: LTE SNR Delta (uint16)
+	//   0x27: LTE RSRQ Delta (uint16)
+	//   0x29: LTE RSRP Delta (uint16)
+	//   0x2A: LTE Report ([uint8 rate, uint8 average_period])
+	//   0x34: NR5G SNR Delta (uint16)
+	//   0x36: NR5G RSRP Delta (uint16)
+	//   0x37: NR5G Report ([uint8 rate, uint8 average_period])
+	//   0x39: NR5G RSRQ Delta (uint16)
+	tlvs := make([]TLV, 0, 8)
 	if cfg.LTEEnabled {
-		tlvs = append(tlvs, TLV{
-			Type: 0x10,
-			Value: []byte{
-				0x01,
-				cfg.LTERSRPDelta,
-				cfg.LTERSRQDelta,
-				cfg.LTESNRDelta,
-			},
-		})
+		addedLTE := false
+		if cfg.LTESNRDelta > 0 {
+			tlvs = append(tlvs, NewTLVUint16(0x25, uint16(cfg.LTESNRDelta)*10))
+			addedLTE = true
+		}
+		if cfg.LTERSRQDelta > 0 {
+			tlvs = append(tlvs, NewTLVUint16(0x27, uint16(cfg.LTERSRQDelta)*10))
+			addedLTE = true
+		}
+		if cfg.LTERSRPDelta > 0 {
+			tlvs = append(tlvs, NewTLVUint16(0x29, uint16(cfg.LTERSRPDelta)*10))
+			addedLTE = true
+		}
+		if cfg.HasLTEReport {
+			tlvs = append(tlvs, TLV{Type: 0x2A, Value: []byte{cfg.LTEReportRate, cfg.LTEReportAveragePeriod}})
+			addedLTE = true
+		} else if !addedLTE {
+			tlvs = append(tlvs, TLV{Type: 0x2A, Value: []byte{0x01, 0x01}})
+		}
 	}
 	if cfg.NR5GEnabled {
-		tlvs = append(tlvs, TLV{
-			Type: 0x11,
-			Value: []byte{
-				0x01,
-				cfg.NR5GRSRPDelta,
-				cfg.NR5GRSRQDelta,
-				cfg.NR5GSINRDelta,
-			},
-		})
+		addedNR := false
+		if cfg.NR5GSINRDelta > 0 {
+			tlvs = append(tlvs, NewTLVUint16(0x34, uint16(cfg.NR5GSINRDelta)*10))
+			addedNR = true
+		}
+		if cfg.NR5GRSRPDelta > 0 {
+			tlvs = append(tlvs, NewTLVUint16(0x36, uint16(cfg.NR5GRSRPDelta)*10))
+			addedNR = true
+		}
+		if cfg.NR5GRSRQDelta > 0 {
+			tlvs = append(tlvs, NewTLVUint16(0x39, uint16(cfg.NR5GRSRQDelta)*10))
+			addedNR = true
+		}
+		if cfg.HasNR5GReport {
+			tlvs = append(tlvs, TLV{Type: 0x37, Value: []byte{cfg.NR5GReportRate, cfg.NR5GReportAveragePeriod}})
+			addedNR = true
+		} else if !addedNR {
+			tlvs = append(tlvs, TLV{Type: 0x37, Value: []byte{0x01, 0x01}})
+		}
 	}
 	if len(tlvs) == 0 {
-		return fmt.Errorf("config signal info v2 requires at least one RAT config")
+		return nil, fmt.Errorf("config signal info v2 requires at least one RAT config")
+	}
+	return tlvs, nil
+}
+
+// ConfigSignalInfoV2 sets signal-info indication reporting behavior.
+func (n *NASService) ConfigSignalInfoV2(ctx context.Context, cfg NASSignalInfoConfigV2) error {
+	tlvs, err := buildConfigSignalInfoV2TLVs(cfg)
+	if err != nil {
+		return err
 	}
 
 	resp, err := n.client.SendRequest(ctx, ServiceNAS, n.clientID, NASConfigSignalInfoV2, tlvs)
@@ -1041,19 +1133,39 @@ func buildSystemSelectionPreferenceTLVs(pref SystemSelectionPreference) ([]TLV, 
 	return tlvs, nil
 }
 
+const nasSignalUnmeasured int16 = -32768
+
 func parseSignalInfoPacket(packet *Packet) (*SignalInfo, error) {
+	if packet == nil {
+		return nil, fmt.Errorf("signal info packet is nil")
+	}
 	info := &SignalInfo{}
 
 	if tlv := FindTLV(packet.TLVs, 0x14); tlv != nil && len(tlv.Value) >= 6 {
 		info.LTERSRQ = int16(int8(tlv.Value[1]))
-		info.LTERSRP = int16(binary.LittleEndian.Uint16(tlv.Value[2:4]))
-		info.LTERSSNR = int16(binary.LittleEndian.Uint16(tlv.Value[4:6]))
+		if rsrp := int16(binary.LittleEndian.Uint16(tlv.Value[2:4])); rsrp != nasSignalUnmeasured {
+			info.LTERSRP = rsrp
+		}
+		if snr := int16(binary.LittleEndian.Uint16(tlv.Value[4:6])); snr != nasSignalUnmeasured {
+			info.LTERSSNR = snr
+		}
 	}
 
-	if tlv := FindTLV(packet.TLVs, 0x17); tlv != nil && len(tlv.Value) >= 6 {
-		info.NR5GRSRP = int16(binary.LittleEndian.Uint16(tlv.Value[2:4]))
-		info.NR5GRSRQ = int16(binary.LittleEndian.Uint16(tlv.Value[0:2]))
-		info.NR5GSINR = int16(binary.LittleEndian.Uint16(tlv.Value[4:6]))
+	// TLV 0x17: 5G NR Signal Strength Info -> [int16 RSRP (dBm), int16 SNR (0.1 dB)] (4 bytes)
+	if tlv := FindTLV(packet.TLVs, 0x17); tlv != nil && len(tlv.Value) >= 4 {
+		if rsrp := int16(binary.LittleEndian.Uint16(tlv.Value[0:2])); rsrp != nasSignalUnmeasured {
+			info.NR5GRSRP = rsrp
+		}
+		if snr := int16(binary.LittleEndian.Uint16(tlv.Value[2:4])); snr != nasSignalUnmeasured {
+			info.NR5GSINR = snr
+		}
+	}
+
+	// TLV 0x18: 5G NR RSRQ -> [int16 RSRQ (dB)] (2 bytes)
+	if tlv := FindTLV(packet.TLVs, 0x18); tlv != nil && len(tlv.Value) >= 2 {
+		if rsrq := int16(binary.LittleEndian.Uint16(tlv.Value[0:2])); rsrq != nasSignalUnmeasured {
+			info.NR5GRSRQ = rsrq
+		}
 	}
 
 	return info, nil
@@ -1064,19 +1176,135 @@ func ParseSignalInfoIndication(packet *Packet) (*SignalInfo, error) {
 }
 
 func parseOperatorNamePacket(packet *Packet, checkResult bool) (*NASOperatorNameInfo, error) {
+	if packet == nil {
+		return nil, fmt.Errorf("operator name packet is nil")
+	}
 	if checkResult {
 		if err := packet.CheckResult(); err != nil {
 			return nil, fmt.Errorf("get operator name failed: %w", err)
 		}
 	}
 	info := &NASOperatorNameInfo{}
-	if tlv := FindTLV(packet.TLVs, 0x10); tlv != nil && len(tlv.Value) >= 1 {
-		info.ServiceProviderName = string(tlv.Value[1:])
+	// TLV 0x10: Service Provider Name -> [display_condition(1), spn_len(1), spn_bytes...]
+	if tlv := FindTLV(packet.TLVs, 0x10); tlv != nil && len(tlv.Value) >= 2 {
+		info.SPNDisplayCondition = tlv.Value[0]
+		info.HasSPNDisplayCondition = true
+		spnLen := int(tlv.Value[1])
+		if spnLen > len(tlv.Value)-2 {
+			spnLen = len(tlv.Value) - 2
+		}
+		info.ServiceProviderName = decodeNASSPNBytes(tlv.Value[2 : 2+spnLen])
 	}
-	if tlv := FindTLV(packet.TLVs, 0x13); tlv != nil {
-		info.OperatorStringName = string(tlv.Value)
+	// TLV 0x12: Operator PLMN Name (EONS array)
+	if tlv := FindTLV(packet.TLVs, 0x12); tlv != nil && len(tlv.Value) >= 1 {
+		count := int(tlv.Value[0])
+		offset := 1
+		for i := 0; i < count && len(tlv.Value)-offset >= 5; i++ {
+			enc := tlv.Value[offset]
+			longSpare := int(tlv.Value[offset+2])
+			shortSpare := int(tlv.Value[offset+3])
+			longLen := int(tlv.Value[offset+4])
+			offset += 5
+			if longLen > len(tlv.Value)-offset {
+				break
+			}
+			longBytes := tlv.Value[offset : offset+longLen]
+			offset += longLen
+			if len(tlv.Value)-offset < 1 {
+				break
+			}
+			shortLen := int(tlv.Value[offset])
+			offset++
+			if shortLen > len(tlv.Value)-offset {
+				break
+			}
+			shortBytes := tlv.Value[offset : offset+shortLen]
+			offset += shortLen
+			if info.PLMNLongName == "" {
+				info.PLMNLongName = decodeNASEncodedName(enc, longSpare, longBytes)
+			}
+			if info.PLMNShortName == "" {
+				info.PLMNShortName = decodeNASEncodedName(enc, shortSpare, shortBytes)
+			}
+		}
+	}
+	// TLV 0x13: Operator String Name (ASCII) or structured NITZ payload on some firmware
+	if tlv := FindTLV(packet.TLVs, 0x13); tlv != nil && len(tlv.Value) > 0 {
+		if nitz, ok := decodeNASNITZTLV(tlv.Value); ok {
+			info.NITZOperatorName = nitz
+			info.OperatorStringName = nitz
+		} else {
+			info.OperatorStringName = strings.TrimSpace(strings.ReplaceAll(string(tlv.Value), "\x00", ""))
+		}
+	}
+	// TLV 0x14: NITZ Information -> [encoding(1), country_initials(1), long_name(1), spare_bits(1), len(1), bytes...]
+	if tlv := FindTLV(packet.TLVs, 0x14); tlv != nil {
+		if nitz, ok := decodeNASNITZTLV(tlv.Value); ok {
+			info.NITZOperatorName = nitz
+			if info.OperatorStringName == "" {
+				info.OperatorStringName = nitz
+			}
+		}
+	}
+	if info.OperatorStringName == "" && info.PLMNLongName != "" {
+		info.OperatorStringName = info.PLMNLongName
 	}
 	return info, nil
+}
+
+func decodeNASSPNBytes(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	if s, err := decodeSIMAlphaIdentifier(raw); err == nil && s != "" {
+		return s
+	}
+	return strings.TrimSpace(strings.ReplaceAll(string(trimSIMFFPadding(raw)), "\x00", ""))
+}
+
+func decodeNASNITZTLV(val []byte) (string, bool) {
+	if len(val) < 5 {
+		return "", false
+	}
+	enc := val[0]
+	if enc != 0x00 && enc != 0x01 {
+		return "", false
+	}
+	spareBits := int(val[3])
+	if spareBits > 7 {
+		return "", false
+	}
+	nameLen := int(val[4])
+	if 5+nameLen > len(val) {
+		return "", false
+	}
+	return decodeNASEncodedName(enc, spareBits, val[5:5+nameLen]), true
+}
+
+func decodeNASEncodedName(encoding uint8, spareBits int, payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	switch encoding {
+	case 0x00:
+		if spareBits < 0 {
+			spareBits = 0
+			if len(payload)%7 == 0 && (payload[len(payload)-1]>>1) == 0x00 {
+				spareBits = 7
+			}
+		}
+		if s, err := decodePackedGSM7(payload, spareBits); err == nil {
+			return s
+		}
+		return strings.TrimSpace(strings.ReplaceAll(string(payload), "\x00", ""))
+	case 0x01:
+		if s, err := decodeSPNUCS2(payload); err == nil {
+			return strings.TrimSpace(strings.ReplaceAll(s, "\x00", ""))
+		}
+		return ""
+	default:
+		return strings.TrimSpace(strings.ReplaceAll(string(payload), "\x00", ""))
+	}
 }
 
 func formatNetworkScanMNC(mnc uint16, includesPCSDigit bool) string {
@@ -1567,12 +1795,30 @@ func ParseNetworkRejectIndication(packet *Packet) (*NASNetworkRejectInfo, error)
 		return nil, fmt.Errorf("network reject indication packet is nil")
 	}
 	info := &NASNetworkRejectInfo{}
-	if tlv := FindTLV(packet.TLVs, 0x10); tlv != nil && len(tlv.Value) >= 5 {
+	// QMI_NAS_NETWORK_REJECT_IND (0x0068):
+	//   TLV 0x01: RadioInterface (uint8)
+	//   TLV 0x02: ServiceDomain (uint8)
+	//   TLV 0x03: RejectCause (uint8)
+	//   TLV 0x10: PLMN ([MCC uint16 LE, MNC uint16 LE, IncludesPCSDigit uint8])
+	//   TLV 0x11: ClosedSubscriberGroupID (uint32 LE)
+	if tlv := FindTLV(packet.TLVs, 0x01); tlv != nil && len(tlv.Value) >= 1 {
 		info.RadioInterface = tlv.Value[0]
-		info.RejectCause = binary.LittleEndian.Uint32(tlv.Value[1:5])
 	}
-	if tlv := FindTLV(packet.TLVs, 0x11); tlv != nil {
-		info.PLMN = string(tlv.Value)
+	if tlv := FindTLV(packet.TLVs, 0x02); tlv != nil && len(tlv.Value) >= 1 {
+		info.ServiceDomain = tlv.Value[0]
+	}
+	if tlv := FindTLV(packet.TLVs, 0x03); tlv != nil && len(tlv.Value) >= 1 {
+		info.RejectCause = uint32(tlv.Value[0])
+	}
+	if tlv := FindTLV(packet.TLVs, 0x10); tlv != nil && len(tlv.Value) >= 5 {
+		mcc := binary.LittleEndian.Uint16(tlv.Value[0:2])
+		mnc := binary.LittleEndian.Uint16(tlv.Value[2:4])
+		includesPCS := tlv.Value[4] != 0
+		info.PLMN = fmt.Sprintf("%03d%s", mcc, formatNetworkScanMNC(mnc, includesPCS))
+	}
+	if tlv := FindTLV(packet.TLVs, 0x11); tlv != nil && len(tlv.Value) >= 4 {
+		info.CSGID = binary.LittleEndian.Uint32(tlv.Value[0:4])
+		info.HasCSGID = true
 	}
 	return info, nil
 }

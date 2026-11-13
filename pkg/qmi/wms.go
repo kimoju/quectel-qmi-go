@@ -271,25 +271,80 @@ func (w *WMSService) ListMessagesAuto(ctx context.Context, storageType uint8) ([
 	}
 
 	storage := TLV{Type: 0x01, Value: []byte{storageType}}
-	mode := TLV{Type: 0x10, Value: []byte{uint8(MessageModeGW)}}
+	// In QMI_WMS_LIST_MESSAGES (0x0031), MessageMode is TLV 0x12 (not 0x10).
+	mode := TLV{Type: 0x12, Value: []byte{uint8(MessageModeGW)}}
 
-	attempts := [][]TLV{
-		{storage, {Type: 0x11, Value: []byte{uint8(TagTypeMTNotRead)}}},
-		{storage, {Type: 0x11, Value: []byte{uint8(TagTypeMTNotRead)}}, mode},
-		{storage, {Type: 0x02, Value: []byte{uint8(TagTypeMTNotRead)}}},
-		{storage, {Type: 0x02, Value: []byte{uint8(TagTypeMTNotRead)}}, mode},
-		{storage, {Type: 0x11, Value: []byte{uint8(TagTypeMTRead)}}},
-		{storage, {Type: 0x11, Value: []byte{uint8(TagTypeMTRead)}}, mode},
-	}
-
+	// First try listing without a MessageTag filter so all tags (MT_NOT_READ,
+	// MT_READ, MO_SENT, MO_NOT_SENT) are returned in a single query.
 	var lastErr error
-	for _, tlvs := range attempts {
+	for _, tlvs := range [][]TLV{
+		{storage, mode},
+		{storage},
+	} {
 		msgs, err := try(tlvs)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 		return msgs, nil
+	}
+
+	// Fallback for firmware requiring an explicit MessageTag TLV: query all tags
+	// and merge deduplicated results so read messages are never omitted.
+	allTags := []MessageTagType{
+		TagTypeMTNotRead,
+		TagTypeMTRead,
+		TagTypeMOSent,
+		TagTypeMONotSent,
+	}
+	type tagAttemptBuilder func(tag MessageTagType) []TLV
+	builders := []tagAttemptBuilder{
+		func(tag MessageTagType) []TLV {
+			return []TLV{storage, {Type: 0x11, Value: []byte{uint8(tag)}}, mode}
+		},
+		func(tag MessageTagType) []TLV {
+			return []TLV{storage, {Type: 0x11, Value: []byte{uint8(tag)}}}
+		},
+		func(tag MessageTagType) []TLV {
+			return []TLV{storage, {Type: 0x02, Value: []byte{uint8(tag)}}, mode}
+		},
+		func(tag MessageTagType) []TLV {
+			return []TLV{storage, {Type: 0x02, Value: []byte{uint8(tag)}}}
+		},
+	}
+
+	for _, build := range builders {
+		firstMsgs, err := try(build(allTags[0]))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		seen := make(map[uint32]struct{}, len(firstMsgs))
+		merged := make([]struct {
+			Index uint32
+			Tag   MessageTagType
+		}, 0, len(firstMsgs))
+		for _, m := range firstMsgs {
+			if _, ok := seen[m.Index]; ok {
+				continue
+			}
+			seen[m.Index] = struct{}{}
+			merged = append(merged, m)
+		}
+		for _, tag := range allTags[1:] {
+			more, err := try(build(tag))
+			if err != nil {
+				continue
+			}
+			for _, m := range more {
+				if _, ok := seen[m.Index]; ok {
+					continue
+				}
+				seen[m.Index] = struct{}{}
+				merged = append(merged, m)
+			}
+		}
+		return merged, nil
 	}
 	return nil, lastErr
 }
@@ -336,24 +391,44 @@ func parseRawReadMessageValue(val []byte) (rawReadMessageValue, error) {
 		return rawReadMessageValue{}, fmt.Errorf("raw message TLV too short")
 	}
 
-	// Untagged format: [Format(1)], [Length(2)], [Data(N)].
-	length := int(binary.LittleEndian.Uint16(val[1:3]))
-	if length <= len(val)-3 {
-		return rawReadMessageValue{
-			data: append([]byte(nil), val[3:3+length]...),
-		}, nil
-	}
-
-	// Tagged format: [Tag(1)], [Format(1)], [Length(2)], [Data(N)].
-	if len(val) >= 4 {
-		length = int(binary.LittleEndian.Uint16(val[2:4]))
-		if isKnownMessageTagType(val[0]) && length <= len(val)-4 {
+	// 1. Exact standard QMI 4-byte tagged format: [Tag(1)], [Format(1)], [Length(2)], [Data(N)].
+	if len(val) >= 4 && isKnownMessageTagType(val[0]) {
+		taggedLen := int(binary.LittleEndian.Uint16(val[2:4]))
+		if taggedLen == len(val)-4 {
 			return rawReadMessageValue{
 				tag:    MessageTagType(val[0]),
 				hasTag: true,
-				data:   append([]byte(nil), val[4:4+length]...),
+				data:   append([]byte(nil), val[4:4+taggedLen]...),
 			}, nil
 		}
+	}
+
+	// 2. Exact 3-byte untagged format: [Format(1)], [Length(2)], [Data(N)].
+	untaggedLen := int(binary.LittleEndian.Uint16(val[1:3]))
+	if untaggedLen == len(val)-3 {
+		return rawReadMessageValue{
+			data: append([]byte(nil), val[3:3+untaggedLen]...),
+		}, nil
+	}
+
+	// 3. Padded 4-byte tagged format (check before padded untagged so 256+ byte
+	// PDUs where low length byte is 0x00 are never truncated to Format bytes).
+	if len(val) >= 4 && isKnownMessageTagType(val[0]) {
+		taggedLen := int(binary.LittleEndian.Uint16(val[2:4]))
+		if taggedLen <= len(val)-4 {
+			return rawReadMessageValue{
+				tag:    MessageTagType(val[0]),
+				hasTag: true,
+				data:   append([]byte(nil), val[4:4+taggedLen]...),
+			}, nil
+		}
+	}
+
+	// 4. Padded 3-byte untagged format.
+	if untaggedLen <= len(val)-3 {
+		return rawReadMessageValue{
+			data: append([]byte(nil), val[3:3+untaggedLen]...),
+		}, nil
 	}
 
 	return rawReadMessageValue{

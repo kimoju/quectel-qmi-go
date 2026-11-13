@@ -503,13 +503,16 @@ func TestBuildNASRegisterIndicationsTLVs(t *testing.T) {
 func TestParseOperatorNameIndication(t *testing.T) {
 	packet := &Packet{
 		TLVs: []TLV{
-			{Type: 0x10, Value: []byte{0x00, 'C', 'a', 'r', 'r', 'i', 'e', 'r'}},
+			{Type: 0x10, Value: []byte{0x01, 0x07, 'C', 'a', 'r', 'r', 'i', 'e', 'r'}},
 			{Type: 0x13, Value: []byte("Carrier LTE")},
 		},
 	}
 	info, err := ParseOperatorNameIndication(packet)
 	if err != nil {
 		t.Fatalf("ParseOperatorNameIndication returned error: %v", err)
+	}
+	if !info.HasSPNDisplayCondition || info.SPNDisplayCondition != 0x01 {
+		t.Fatalf("unexpected SPN display condition: %+v", info)
 	}
 	if info.ServiceProviderName != "Carrier" || info.OperatorStringName != "Carrier LTE" {
 		t.Fatalf("unexpected operator name info: %+v", info)
@@ -519,16 +522,22 @@ func TestParseOperatorNameIndication(t *testing.T) {
 func TestParseNetworkRejectIndication(t *testing.T) {
 	packet := &Packet{
 		TLVs: []TLV{
-			{Type: 0x10, Value: []byte{0x08, 0x15, 0x00, 0x00, 0x00}},
-			{Type: 0x11, Value: []byte("46001")},
+			{Type: 0x01, Value: []byte{0x08}},
+			{Type: 0x02, Value: []byte{0x02}},
+			{Type: 0x03, Value: []byte{21}},
+			{Type: 0x10, Value: []byte{0xCC, 0x01, 0x01, 0x00, 0x00}},
+			{Type: 0x11, Value: []byte{0x78, 0x56, 0x34, 0x12}},
 		},
 	}
 	info, err := ParseNetworkRejectIndication(packet)
 	if err != nil {
 		t.Fatalf("ParseNetworkRejectIndication returned error: %v", err)
 	}
-	if info.RadioInterface != 0x08 || info.RejectCause != 21 || info.PLMN != "46001" {
+	if info.RadioInterface != 0x08 || info.ServiceDomain != 0x02 || info.RejectCause != 21 || info.PLMN != "46001" {
 		t.Fatalf("unexpected network reject payload: %+v", info)
+	}
+	if !info.HasCSGID || info.CSGID != 0x12345678 {
+		t.Fatalf("unexpected CSGID in network reject payload: %+v", info)
 	}
 }
 

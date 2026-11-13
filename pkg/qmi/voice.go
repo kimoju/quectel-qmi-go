@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"strings"
+	"unicode/utf16"
 )
 
 // ============================================================================
@@ -889,12 +891,125 @@ func parseVoiceUSSDPayloadTLV(tlv *TLV) (*VoiceUSSDPayload, error) {
 	if len(tlv.Value) < 2+length {
 		return nil, fmt.Errorf("voice ussd payload TLV truncated: need %d, have %d", 2+length, len(tlv.Value))
 	}
+	dcs := tlv.Value[0]
 	data := append([]byte(nil), tlv.Value[2:2+length]...)
 	return &VoiceUSSDPayload{
-		DCS:  tlv.Value[0],
+		DCS:  dcs,
 		Data: data,
-		Text: string(data),
+		Text: decodeVoiceUSSDPayloadText(dcs, data),
 	}, nil
+}
+
+func decodeVoiceUSSDPayloadText(dcs uint8, data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	if isVoiceUSSDUCS2DCS(dcs) {
+		if s, ok := decodeVoiceUSSDUCS2(data); ok {
+			return s
+		}
+	}
+	if isVoiceUSSDGSM7DCS(dcs) {
+		if isPrintableUSSDASCII(data) {
+			return string(data)
+		}
+		if s, err := decodeVoicePackedGSM7(data); err == nil {
+			return s
+		}
+		if s, err := decodeSPNGSM(data); err == nil {
+			return s
+		}
+	}
+	return strings.TrimRight(string(data), "\x00")
+}
+
+func isVoiceUSSDUCS2DCS(dcs uint8) bool {
+	// QMI_VOICE_USSD_DATA_CODING_SCHEME_UCS2 == 0x03;
+	// 3GPP TS 23.038 CBS/USSD UCS-2 DCS values include 0x08, 0x11, 0x48..0x4B, 0x98..0x9B.
+	if dcs == 0x03 || dcs == 0x11 {
+		return true
+	}
+	switch dcs & 0xF0 {
+	case 0x00:
+		return dcs >= 0x08 && ((dcs>>2)&0x03) == 0x02
+	case 0x40, 0x50, 0x60, 0x70, 0x90:
+		return ((dcs >> 2) & 0x03) == 0x02
+	default:
+		return false
+	}
+}
+
+func isVoiceUSSDGSM7DCS(dcs uint8) bool {
+	if dcs == 0x01 || dcs == 0x02 || isVoiceUSSDUCS2DCS(dcs) {
+		return false
+	}
+	if dcs == 0x0F || dcs == 0x00 {
+		return true
+	}
+	switch dcs & 0xF0 {
+	case 0x00:
+		return dcs != 0x04
+	case 0x10:
+		return dcs == 0x10
+	case 0x40, 0x50, 0x60, 0x70:
+		return ((dcs >> 2) & 0x03) == 0x00
+	default:
+		return false
+	}
+}
+
+func isPrintableUSSDASCII(data []byte) bool {
+	for _, b := range data {
+		if (b >= 0x20 && b <= 0x7E) || b == '\r' || b == '\n' || b == '\t' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func decodeVoiceUSSDUCS2(data []byte) (string, bool) {
+	trimmed := trimUCS2Padding(data)
+	if len(trimmed) == 0 || len(trimmed)%2 != 0 {
+		return "", false
+	}
+	units := make([]uint16, 0, len(trimmed)/2)
+	for i := 0; i < len(trimmed); i += 2 {
+		units = append(units, binary.BigEndian.Uint16(trimmed[i:i+2]))
+	}
+	return strings.TrimRight(string(utf16.Decode(units)), "\x00"), true
+}
+
+func decodeVoicePackedGSM7(data []byte) (string, error) {
+	spareBits := 0
+	if len(data)%7 == 0 && len(data) > 0 {
+		lastSeptet := data[len(data)-1] >> 1
+		// Per 3GPP TS 23.038 §6.1.2.3.1, <CR> (0x0D) or 0x00 pads 7-byte USSD boundaries.
+		if lastSeptet == 0x0D || lastSeptet == 0x00 {
+			spareBits = 7
+		}
+	}
+	septets := (len(data)*8 - spareBits) / 7
+	if septets <= 0 {
+		return "", fmt.Errorf("USSD GSM7 payload empty")
+	}
+	unpacked := make([]byte, 0, septets)
+	buf := 0
+	bits := 0
+	for _, b := range data {
+		buf |= int(b) << bits
+		bits += 8
+		for bits >= 7 && len(unpacked) < septets {
+			unpacked = append(unpacked, byte(buf&0x7F))
+			buf >>= 7
+			bits -= 7
+		}
+	}
+	decoded, err := decodeSPNGSM(unpacked)
+	if err != nil {
+		return "", err
+	}
+	return strings.ReplaceAll(decoded, "\x00", ""), nil
 }
 
 func parseUint16ArrayWithUint8Length(value []byte) ([]uint16, error) {

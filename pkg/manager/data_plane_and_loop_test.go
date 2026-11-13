@@ -22,6 +22,14 @@ type recordingNetConfigurator struct {
 	setIPv4Err       error
 	setIPv6Err       error
 	currentIP        net.IP
+	currentIPs       []net.IP
+	dnsServers       []string
+	dnsRestoreCalls  int
+	defaultRoutes    []net.IP
+	directRoutesV4   int
+	directRoutesV6   int
+	setMTUs          []int
+	rawIPEnabled     []string
 }
 
 func (r *recordingNetConfigurator) SetIPAddress(ifname string, ip net.IP, prefixLen int) error {
@@ -30,28 +38,61 @@ func (r *recordingNetConfigurator) SetIPAddress(ifname string, ip net.IP, prefix
 	if r.setIPv4Err != nil {
 		return r.setIPv4Err
 	}
-	r.currentIP = append(net.IP(nil), ip...)
+	cp := append(net.IP(nil), ip...)
+	r.currentIP = cp
+	r.replaceFamilyIPLocked(cp)
 	return nil
 }
 
 func (r *recordingNetConfigurator) SetIPv6Address(ifname string, ip net.IP, prefixLen int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.setIPv6Err
+	if r.setIPv6Err != nil {
+		return r.setIPv6Err
+	}
+	cp := append(net.IP(nil), ip...)
+	if r.currentIP == nil {
+		r.currentIP = cp
+	}
+	r.replaceFamilyIPLocked(cp)
+	return nil
+}
+
+func (r *recordingNetConfigurator) replaceFamilyIPLocked(ip net.IP) {
+	isV4 := ip.To4() != nil
+	kept := r.currentIPs[:0]
+	for _, existing := range r.currentIPs {
+		if (existing.To4() != nil) != isV4 {
+			kept = append(kept, existing)
+		}
+	}
+	r.currentIPs = append(kept, ip)
 }
 
 func (r *recordingNetConfigurator) FlushAddresses(ifname string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.flushedAddresses = append(r.flushedAddresses, ifname)
+	r.currentIP = nil
+	r.currentIPs = nil
 	return nil
 }
 
 func (r *recordingNetConfigurator) AddDefaultRoute(ifname string, gateway net.IP) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.defaultRoutes = append(r.defaultRoutes, append(net.IP(nil), gateway...))
 	return nil
 }
 
 func (r *recordingNetConfigurator) AddDefaultRouteDirect(ifname string, ipv6 bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if ipv6 {
+		r.directRoutesV6++
+	} else {
+		r.directRoutesV4++
+	}
 	return nil
 }
 
@@ -76,7 +117,12 @@ func (r *recordingNetConfigurator) BringDown(ifname string) error {
 	return nil
 }
 
-func (r *recordingNetConfigurator) SetMTU(ifname string, mtu int) error { return nil }
+func (r *recordingNetConfigurator) SetMTU(ifname string, mtu int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.setMTUs = append(r.setMTUs, mtu)
+	return nil
+}
 
 func (r *recordingNetConfigurator) GetCurrentIP(ifname string) (net.IP, error) {
 	r.mu.Lock()
@@ -84,15 +130,55 @@ func (r *recordingNetConfigurator) GetCurrentIP(ifname string) (net.IP, error) {
 	return r.currentIP, nil
 }
 
-func (r *recordingNetConfigurator) IsUp(ifname string) (bool, error)  { return true, nil }
-func (r *recordingNetConfigurator) UpdateDNS(dns1, dns2 string) error { return nil }
-func (r *recordingNetConfigurator) RestoreDNS() error                 { return nil }
+func (r *recordingNetConfigurator) GetCurrentIPs(ifname string) ([]net.IP, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]net.IP, len(r.currentIPs))
+	for i, ip := range r.currentIPs {
+		out[i] = append(net.IP(nil), ip...)
+	}
+	return out, nil
+}
+
+func (r *recordingNetConfigurator) IsUp(ifname string) (bool, error) { return true, nil }
+
+func (r *recordingNetConfigurator) UpdateDNS(dns1, dns2 string) error {
+	var servers []string
+	if dns1 != "" {
+		servers = append(servers, dns1)
+	}
+	if dns2 != "" {
+		servers = append(servers, dns2)
+	}
+	return r.UpdateDNSServers(servers...)
+}
+
+func (r *recordingNetConfigurator) UpdateDNSServers(servers ...string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.dnsServers = append([]string(nil), servers...)
+	return nil
+}
+
+func (r *recordingNetConfigurator) RestoreDNS() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.dnsRestoreCalls++
+	r.dnsServers = nil
+	return nil
+}
+
 func (r *recordingNetConfigurator) AddQMAPMux(string, uint8) (string, error) {
 	return "qmimux0", nil
 }
 func (r *recordingNetConfigurator) DelQMAPMux(string, uint8) error       { return nil }
 func (r *recordingNetConfigurator) GetQMAPMuxIface(string, uint8) string { return "qmimux0" }
-func (r *recordingNetConfigurator) EnableRawIP(string) error             { return nil }
+func (r *recordingNetConfigurator) EnableRawIP(ifname string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rawIPEnabled = append(r.rawIPEnabled, ifname)
+	return nil
+}
 
 func installMockNetConfigurator(t *testing.T, mock *recordingNetConfigurator) {
 	t.Helper()

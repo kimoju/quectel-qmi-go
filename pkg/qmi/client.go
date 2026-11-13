@@ -5,8 +5,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -162,7 +164,8 @@ type Client struct {
 	ctlTxID                uint32 // separate counter for CTL (1 byte) / CTL的独立计数器 (1字节)
 
 	// Client ID cache / 客户端ID缓存
-	clientIDs map[uint8]uint8 // service -> clientID / 服务 -> 客户端ID
+	clientIDs map[uint8]map[uint8]struct{} // service -> set of clientIDs / 服务 -> 客户端ID集合
+	fatalErr  error
 
 	// Event handling / 事件处理
 	eventCh           chan Event
@@ -170,7 +173,9 @@ type Client struct {
 	coalescedSignalCh chan struct{}
 	writeCh           chan writeRequest
 	closeCh           chan struct{}
+	deadCh            chan struct{}
 	closeOnce         sync.Once
+	deadOnce          sync.Once
 	wg                sync.WaitGroup
 
 	coalescedMu sync.Mutex
@@ -182,8 +187,24 @@ type Client struct {
 	droppedEdgeIndications atomic.Uint64
 }
 
+func isZeroClientOptions(opts ClientOptions) bool {
+	return !opts.SyncOnOpen &&
+		!opts.QueryVersionOnOpen &&
+		opts.ReadDeadline == 0 &&
+		opts.DefaultRequestTimeout == 0 &&
+		opts.TxQueueSize == 0 &&
+		opts.IndicationQueueSize == 0 &&
+		!opts.UseProxy &&
+		opts.ProxyPath == "" &&
+		opts.ProxyExecutable == "" &&
+		opts.ProxyOpenTimeout == 0 &&
+		!opts.ProxyFallbackToRaw &&
+		opts.Logf == nil
+}
+
 func normalizeClientOptions(opts ClientOptions) ClientOptions {
 	defaults := DefaultClientOptions()
+	isZero := isZeroClientOptions(opts)
 	if opts.ReadDeadline <= 0 {
 		opts.ReadDeadline = defaults.ReadDeadline
 	}
@@ -205,21 +226,14 @@ func normalizeClientOptions(opts ClientOptions) ClientOptions {
 	if opts.ProxyOpenTimeout <= 0 {
 		opts.ProxyOpenTimeout = defaults.ProxyOpenTimeout
 	}
-	// Preserve backwards-compatible zero-value construction while still allowing explicit false
-	// when at least one other option is set.
-	if !opts.SyncOnOpen &&
-		opts.ReadDeadline == defaults.ReadDeadline &&
-		opts.DefaultRequestTimeout == defaults.DefaultRequestTimeout &&
-		opts.TxQueueSize == defaults.TxQueueSize &&
-		opts.IndicationQueueSize == defaults.IndicationQueueSize {
+	// Preserve backwards-compatible zero-value construction while honoring explicit false
+	// whenever any option is specified. Never send CTLSync when UseProxy is enabled.
+	if isZero {
 		opts.SyncOnOpen = defaults.SyncOnOpen
-	}
-	if !opts.QueryVersionOnOpen &&
-		opts.ReadDeadline == defaults.ReadDeadline &&
-		opts.DefaultRequestTimeout == defaults.DefaultRequestTimeout &&
-		opts.TxQueueSize == defaults.TxQueueSize &&
-		opts.IndicationQueueSize == defaults.IndicationQueueSize {
 		opts.QueryVersionOnOpen = defaults.QueryVersionOnOpen
+	}
+	if opts.UseProxy {
+		opts.SyncOnOpen = false
 	}
 	return opts
 }
@@ -295,8 +309,8 @@ func NewClientWithOptions(ctx context.Context, path string, opts ClientOptions) 
 		}
 	}
 
-	// Initial sync (non-fatal, helps clear modem state) / 初始同步 (非致命，有助于清除modem状态)
-	if opts.SyncOnOpen {
+	// Initial sync (non-fatal, helps clear modem state on raw transport; never send over qmi-proxy!)
+	if c.opts.SyncOnOpen && !c.opts.UseProxy {
 		syncCtx := ctx
 		if syncCtx == nil {
 			syncCtx = context.Background()
@@ -375,12 +389,13 @@ func newClientWithTransport(path string, opts ClientOptions, conn qmiTransport) 
 		opts:               opts,
 		transactions:       make(map[uint32]*transactionEntry),
 		recentTransactions: make(map[uint32]recentTransaction),
-		clientIDs:          make(map[uint8]uint8),
+		clientIDs:          make(map[uint8]map[uint8]struct{}),
 		eventCh:            make(chan Event, opts.IndicationQueueSize),
 		indicationInCh:     make(chan Event, opts.IndicationQueueSize),
 		coalescedSignalCh:  make(chan struct{}, 1),
 		writeCh:            make(chan writeRequest, opts.TxQueueSize),
 		closeCh:            make(chan struct{}),
+		deadCh:             make(chan struct{}),
 		coalesced: coalescedEventStore{
 			events: make(map[string]Event),
 		},
@@ -435,9 +450,55 @@ func (c *Client) Stats() ClientStats {
 	}
 }
 
+func (c *Client) getFatalErr() error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.fatalErr
+}
+
+func (c *Client) handleFatalTransportError(err error) {
+	if err == nil {
+		err = io.EOF
+	}
+	fatal := fmt.Errorf("qmi transport closed: %w", err)
+	c.mu.Lock()
+	if c.fatalErr == nil {
+		c.fatalErr = fatal
+	} else {
+		fatal = c.fatalErr
+	}
+	c.mu.Unlock()
+
+	c.deadOnce.Do(func() {
+		if c.deadCh != nil {
+			close(c.deadCh)
+		}
+	})
+
+	c.failPendingTransactions(fatal)
+	c.enqueueIndication(Event{
+		Type:      EventModemReset,
+		ServiceID: ServiceControl,
+	})
+}
+
 func (c *Client) allocateTransaction(service uint8, msgID uint16, respCh chan *Packet, deadline time.Time) (uint16, uint32, *transactionEntry, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if c.fatalErr != nil {
+		return 0, 0, nil, c.fatalErr
+	}
+	if c.closeCh != nil {
+		select {
+		case <-c.closeCh:
+			return 0, 0, nil, fmt.Errorf("connection closed")
+		default:
+		}
+	}
 
 	if c.transactions == nil {
 		c.transactions = make(map[uint32]*transactionEntry)
@@ -608,7 +669,7 @@ func (c *Client) readLoop() {
 
 		n, err := c.conn.Read(buf)
 		if err != nil {
-			if os.IsTimeout(err) {
+			if os.IsTimeout(err) || errors.Is(err, os.ErrDeadlineExceeded) {
 				continue
 			}
 			select {
@@ -617,7 +678,7 @@ func (c *Client) readLoop() {
 			default:
 			}
 			c.logf(ClientLogLevelWarn, "QMI: read failed: %v", err)
-			c.failPendingTransactions(err)
+			c.handleFatalTransportError(err)
 			return
 		}
 
@@ -670,6 +731,9 @@ func (c *Client) readLoop() {
 			key := uint32(packet.ServiceType)<<16 | uint32(packet.TransactionID)
 			c.mu.Lock()
 			entry, ok := c.transactions[key]
+			if ok && !packet.IsIndication {
+				delete(c.transactions, key)
+			}
 			c.mu.Unlock()
 
 			if !packet.IsIndication {
@@ -707,7 +771,12 @@ func (c *Client) writerLoop() {
 		case <-c.closeCh:
 			return
 		case req := <-c.writeCh:
-			err := c.writeAll(req.data)
+			var err error
+			if fatalErr := c.getFatalErr(); fatalErr != nil {
+				err = fatalErr
+			} else {
+				err = c.writeAll(req.data)
+			}
 			select {
 			case req.result <- err:
 			default:
@@ -749,11 +818,31 @@ func (c *Client) deliverEvent(evt Event) bool {
 }
 
 func (c *Client) writeAll(data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	if !c.opts.UseProxy {
+		// On raw QMI character devices (/dev/cdc-wdm*), each write(2) submits a
+		// single atomic QMUX URB. Sending a partial tail in a second write()
+		// corrupts framing on the modem.
+		n, err := c.conn.Write(data)
+		if err != nil {
+			return fmt.Errorf("write failed: %w", err)
+		}
+		if n != len(data) {
+			return fmt.Errorf("write failed: %w", io.ErrShortWrite)
+		}
+		return nil
+	}
+
 	written := 0
 	for written < len(data) {
 		n, err := c.conn.Write(data[written:])
 		if err != nil {
 			return fmt.Errorf("write failed: %w", err)
+		}
+		if n <= 0 {
+			return fmt.Errorf("write failed: %w", io.ErrShortWrite)
 		}
 		written += n
 	}
@@ -833,29 +922,46 @@ func (c *Client) popCoalescedEvent() (Event, bool) {
 }
 
 func (c *Client) coalescingKey(event Event) (string, bool) {
+	var clientID uint8
+	if event.Packet != nil {
+		clientID = event.Packet.ClientID
+	}
 	switch event.Type {
 	case EventPacketServiceStatusChanged:
-		return fmt.Sprintf("packet-status:%d:%d", event.ServiceID, event.MessageID), true
+		return fmt.Sprintf("packet-status:%d:%d:%d", event.ServiceID, clientID, event.MessageID), true
 	case EventServingSystemChanged:
-		return fmt.Sprintf("serving-system:%d:%d", event.ServiceID, event.MessageID), true
+		return fmt.Sprintf("serving-system:%d:%d:%d", event.ServiceID, clientID, event.MessageID), true
 	case EventNASOperatorNameChanged:
-		return fmt.Sprintf("nas-operator-name:%d:%d", event.ServiceID, event.MessageID), true
+		return fmt.Sprintf("nas-operator-name:%d:%d:%d", event.ServiceID, clientID, event.MessageID), true
 	case EventNASNetworkTimeChanged:
-		return fmt.Sprintf("nas-network-time:%d:%d", event.ServiceID, event.MessageID), true
+		return fmt.Sprintf("nas-network-time:%d:%d:%d", event.ServiceID, clientID, event.MessageID), true
 	case EventNASSignalInfoChanged:
-		return fmt.Sprintf("nas-signal-info:%d:%d", event.ServiceID, event.MessageID), true
+		return fmt.Sprintf("nas-signal-info:%d:%d:%d", event.ServiceID, clientID, event.MessageID), true
 	case EventNASNetworkReject:
-		return fmt.Sprintf("nas-network-reject:%d:%d", event.ServiceID, event.MessageID), true
+		return fmt.Sprintf("nas-network-reject:%d:%d:%d", event.ServiceID, clientID, event.MessageID), true
 	case EventNASIncrementalNetworkScan:
-		return fmt.Sprintf("nas-incremental-scan:%d:%d", event.ServiceID, event.MessageID), true
+		return fmt.Sprintf("nas-incremental-scan:%d:%d:%d", event.ServiceID, clientID, event.MessageID), true
 	case EventNASEventReport:
-		return fmt.Sprintf("nas-event-report:%d:%d", event.ServiceID, event.MessageID), true
+		return fmt.Sprintf("nas-event-report:%d:%d:%d", event.ServiceID, clientID, event.MessageID), true
 	case EventWMSTransportNetworkRegistrationStatus:
-		return fmt.Sprintf("wms-transport:%d:%d", event.ServiceID, event.MessageID), true
+		return fmt.Sprintf("wms-transport:%d:%d:%d", event.ServiceID, clientID, event.MessageID), true
 	case EventModemReset:
+		if event.Packet != nil {
+			if tlv := FindTLV(event.Packet.TLVs, 0x01); tlv != nil && len(tlv.Value) >= 2 {
+				return fmt.Sprintf("critical-modem-reset:%d:%d:%d:%d", event.ServiceID, event.MessageID, tlv.Value[0], tlv.Value[1]), true
+			}
+		}
 		return fmt.Sprintf("critical-modem-reset:%d:%d", event.ServiceID, event.MessageID), true
 	case EventUIMSessionClosed:
-		return fmt.Sprintf("critical-uim-session-closed:%d:%d", event.ServiceID, event.MessageID), true
+		var sessionType uint8 = 0xFF
+		if event.Packet != nil {
+			if tlv := FindTLV(event.Packet.TLVs, 0x10); tlv != nil && len(tlv.Value) >= 1 {
+				sessionType = tlv.Value[0]
+			} else if tlv := FindTLV(event.Packet.TLVs, 0x01); tlv != nil && len(tlv.Value) >= 1 {
+				sessionType = tlv.Value[0]
+			}
+		}
+		return fmt.Sprintf("critical-uim-session-closed:%d:%d:%d:%d", event.ServiceID, clientID, event.MessageID, sessionType), true
 	default:
 		return "", false
 	}
@@ -869,7 +975,7 @@ func (c *Client) dispatchIndication(p *Packet) {
 	case p.ServiceType == ServiceControl && p.MessageID == CTLRevokeClientIDInd:
 		c.handleClientIDRevoke(p)
 		eventType = EventModemReset
-	case (p.ServiceType == ServiceWDS || p.ServiceType == ServiceWDSIPv6) && p.MessageID == WDSGetPktSrvcStatusInd:
+	case p.ServiceType == ServiceWDS && p.MessageID == WDSGetPktSrvcStatusInd:
 		eventType = EventPacketServiceStatusChanged
 	case p.ServiceType == ServiceNAS && (p.MessageID == NASServingSystemInd || p.MessageID == NASSysInfoInd):
 		eventType = EventServingSystemChanged
@@ -930,6 +1036,35 @@ func (c *Client) dispatchIndication(p *Packet) {
 	c.enqueueIndication(event)
 }
 
+func (c *Client) addClientID(service uint8, clientID uint8) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.clientIDs == nil {
+		c.clientIDs = make(map[uint8]map[uint8]struct{})
+	}
+	if c.clientIDs[service] == nil {
+		c.clientIDs[service] = make(map[uint8]struct{})
+	}
+	c.clientIDs[service][clientID] = struct{}{}
+}
+
+func (c *Client) removeClientID(service uint8, clientID uint8) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ids, ok := c.clientIDs[service]
+	if !ok {
+		return false
+	}
+	if _, exists := ids[clientID]; !exists {
+		return false
+	}
+	delete(ids, clientID)
+	if len(ids) == 0 {
+		delete(c.clientIDs, service)
+	}
+	return true
+}
+
 func (c *Client) handleClientIDRevoke(p *Packet) {
 	if p.ServiceType != ServiceControl || p.MessageID != CTLRevokeClientIDInd {
 		return
@@ -940,12 +1075,7 @@ func (c *Client) handleClientIDRevoke(p *Packet) {
 	}
 	service := tlv.Value[0]
 	clientID := tlv.Value[1]
-
-	c.mu.Lock()
-	if cached, ok := c.clientIDs[service]; ok && cached == clientID {
-		delete(c.clientIDs, service)
-	}
-	c.mu.Unlock()
+	c.removeClientID(service, clientID)
 }
 
 // ============================================================================
@@ -1005,18 +1135,51 @@ func (c *Client) SendRequest(ctx context.Context, service uint8, clientID uint8,
 	case c.writeCh <- writeReq:
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-c.deadCh:
+		if fatalErr := c.getFatalErr(); fatalErr != nil {
+			return nil, fatalErr
+		}
+		return nil, fmt.Errorf("connection closed")
 	case <-c.closeCh:
 		return nil, fmt.Errorf("connection closed")
+	}
+
+	drainResp := func() *Packet {
+		select {
+		case pkt, ok := <-respCh:
+			if ok && pkt != nil {
+				return pkt
+			}
+		default:
+		}
+		return nil
 	}
 
 	select {
 	case err := <-writeReq.result:
 		if err != nil {
+			if pkt := drainResp(); pkt != nil {
+				return pkt, nil
+			}
 			return nil, err
 		}
 	case <-ctx.Done():
+		if pkt := drainResp(); pkt != nil {
+			return pkt, nil
+		}
 		return nil, ctx.Err()
+	case <-c.deadCh:
+		if pkt := drainResp(); pkt != nil {
+			return pkt, nil
+		}
+		if fatalErr := c.getFatalErr(); fatalErr != nil {
+			return nil, fatalErr
+		}
+		return nil, fmt.Errorf("connection closed")
 	case <-c.closeCh:
+		if pkt := drainResp(); pkt != nil {
+			return pkt, nil
+		}
 		return nil, fmt.Errorf("connection closed")
 	}
 
@@ -1024,12 +1187,29 @@ func (c *Client) SendRequest(ctx context.Context, service uint8, clientID uint8,
 	select {
 	case resp, ok := <-respCh:
 		if !ok || resp == nil {
+			if fatalErr := c.getFatalErr(); fatalErr != nil {
+				return nil, fatalErr
+			}
 			return nil, fmt.Errorf("connection closed")
 		}
 		return resp, nil
 	case <-ctx.Done():
+		if pkt := drainResp(); pkt != nil {
+			return pkt, nil
+		}
 		return nil, ctx.Err()
+	case <-c.deadCh:
+		if pkt := drainResp(); pkt != nil {
+			return pkt, nil
+		}
+		if fatalErr := c.getFatalErr(); fatalErr != nil {
+			return nil, fatalErr
+		}
+		return nil, fmt.Errorf("connection closed")
 	case <-c.closeCh:
+		if pkt := drainResp(); pkt != nil {
+			return pkt, nil
+		}
 		return nil, fmt.Errorf("connection closed")
 	}
 }
@@ -1086,17 +1266,27 @@ func (c *Client) AllocateClientIDWithContext(ctx context.Context, service uint8)
 			}
 
 			clientID := tlv.Value[1]
-			c.mu.Lock()
-			c.clientIDs[service] = clientID
-			c.mu.Unlock()
+			c.addClientID(service, clientID)
 
 			return clientID, nil
 		}
 		lastErr = err
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || c.getFatalErr() != nil {
 			break
 		}
-		time.Sleep(500 * time.Millisecond)
+		retryTimer := time.NewTimer(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			retryTimer.Stop()
+		case <-c.closeCh:
+			retryTimer.Stop()
+		case <-c.deadCh:
+			retryTimer.Stop()
+		case <-retryTimer.C:
+		}
+		if ctx.Err() != nil || c.getFatalErr() != nil {
+			break
+		}
 	}
 
 	return 0, fmt.Errorf("allocate client ID request failed after retries: %w", lastErr)
@@ -1125,16 +1315,32 @@ func (c *Client) ReleaseClientIDWithContext(ctx context.Context, service uint8, 
 		return err
 	}
 
-	c.mu.Lock()
-	delete(c.clientIDs, service)
-	c.mu.Unlock()
+	c.removeClientID(service, clientID)
 
 	return nil
 }
 
-// GetClientID returns the cached client ID for a service, or 0 if not allocated / GetClientID返回服务的缓存客户端ID，如果未分配则返回0
+// GetClientID returns a cached client ID for a service, or 0 if not allocated / GetClientID返回服务的缓存客户端ID，如果未分配则返回0
 func (c *Client) GetClientID(service uint8) uint8 {
+	ids := c.GetClientIDs(service)
+	if len(ids) == 0 {
+		return 0
+	}
+	return ids[0]
+}
+
+// GetClientIDs returns all cached client IDs allocated for a service in ascending order.
+func (c *Client) GetClientIDs(service uint8) []uint8 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.clientIDs[service]
+	set := c.clientIDs[service]
+	if len(set) == 0 {
+		return nil
+	}
+	out := make([]uint8, 0, len(set))
+	for cid := range set {
+		out = append(out, cid)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }

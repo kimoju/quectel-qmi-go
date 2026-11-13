@@ -64,6 +64,9 @@ func discover(requireControlPath bool) ([]manager.ModemDevice, error) {
 				done <- result{md, err}
 			}()
 
+			timer := time.NewTimer(5 * time.Second)
+			defer timer.Stop()
+
 			select {
 			case res := <-done:
 				if res.err == nil && res.val != nil {
@@ -74,9 +77,8 @@ func discover(requireControlPath bool) ([]manager.ModemDevice, error) {
 					devices = append(devices, *res.val)
 					mu.Unlock()
 				}
-			case <-time.After(5 * time.Second): // 单个设备最大扫描时间 5s
+			case <-timer.C: // 单个设备最大扫描时间 5s
 				// 超时忽略
-				// fmt.Printf("扫描设备 %s 超时\n", path)
 			}
 		}(entry)
 	}
@@ -106,18 +108,15 @@ func discoverFromSysFS(usbPath string) (*manager.ModemDevice, error) {
 	// device.c 逻辑: 查找网络接口
 	// 它扫描interfaces 0 到 bNumInterfaces+8
 	bNumIfaces := readIntFile(filepath.Join(scanUSBPath, "bNumInterfaces"))
-	// fmt.Printf("Num interfaces: %d\n", bNumIfaces)
+	cfgVal := readUSBConfigValue(scanUSBPath)
+	usbName := filepath.Base(scanUSBPath)
 
 	var netInterface string
 	var foundIfaceIndex int
 
 	// 扫描网络接口
 	for i := 0; i < bNumIfaces+8; i++ {
-		// 尝试路径: usbPath/usbName:1.i/net
-		// 上面循环中的 entry.Name() 是 usbName (例如: 1-1)
-		// 接口路径: 1-1:1.i
-		usbName := filepath.Base(scanUSBPath)
-		ifPath := filepath.Join(scanUSBPath, fmt.Sprintf("%s:1.%d", usbName, i))
+		ifPath := filepath.Join(scanUSBPath, fmt.Sprintf("%s:%s.%d", usbName, cfgVal, i))
 
 		netDir := filepath.Join(ifPath, "net")
 		entries, err := os.ReadDir(netDir)
@@ -132,16 +131,21 @@ func discoverFromSysFS(usbPath string) (*manager.ModemDevice, error) {
 		return nil, fmt.Errorf("未找到网络接口")
 	}
 
+	ifPath := filepath.Join(scanUSBPath, fmt.Sprintf("%s:%s.%d", usbName, cfgVal, foundIfaceIndex))
+	ifaceNum, hasIfaceNum := readUSBInterfaceNumber(ifPath, foundIfaceIndex)
+
 	md := &manager.ModemDevice{
-		USBPath:      usbPath,
-		VendorID:     vid,
-		ProductID:    pid,
-		NetInterface: netInterface,
+		USBPath:            usbPath,
+		VendorID:           vid,
+		ProductID:          pid,
+		NetInterface:       netInterface,
+		InterfaceNumber:    ifaceNum,
+		HasInterfaceNumber: hasIfaceNum,
+		BusType:            detectModemBusType(scanUSBPath, ifPath),
 	}
 
 	// device.c 根据接口类/子类确定驱动类型
 	// qmidevice_detect 循环查询 usb_interface_info
-	ifPath := filepath.Join(scanUSBPath, fmt.Sprintf("%s:1.%d", filepath.Base(scanUSBPath), foundIfaceIndex))
 	md.DriverName = determineDriver(ifPath)
 
 	// 确定控制路径 (cdc-wdm)
@@ -178,7 +182,7 @@ func discoverFromSysFS(usbPath string) (*manager.ModemDevice, error) {
 
 	staticPrimary := ""
 	if atIntf != -1 {
-		atIfPath := filepath.Join(scanUSBPath, fmt.Sprintf("%s:1.%d", filepath.Base(scanUSBPath), atIntf))
+		atIfPath := filepath.Join(scanUSBPath, fmt.Sprintf("%s:%s.%d", usbName, cfgVal, atIntf))
 		primary, err := findTTYInInterface(atIfPath)
 		if err == nil && primary != "" {
 			staticPrimary = primary
@@ -186,15 +190,8 @@ func discoverFromSysFS(usbPath string) (*manager.ModemDevice, error) {
 	}
 	md.ATPort, md.ATPortBackup = chooseStaticATPorts(md.ATPorts, staticPrimary)
 
-	if md.ControlPath == "" {
-		// 如果未找到 QMI cdc-wdm，可能是在 ECM 模式下，此时 AT 端口也是控制通道？
-		// 但我们的项目是 qmi-cm，所以我们主要严格要求 QMI (cdc-wdm)。
-		// 但是，返回我们发现的内容更好。
-		// 警告: 如果没有控制路径，功能将受到限制。
-	}
-
 	// 查找同一 USB composite device 下的 ALSA 声卡
-	md.AudioDevice, md.AudioCardNum = findAudioDevice(scanUSBPath)
+	md.AudioDevice, md.AudioCardNum = findAudioDeviceWithConfig(scanUSBPath, cfgVal)
 
 	return md, nil
 }
@@ -432,16 +429,77 @@ func findTTYInInterface(ifPath string) (string, error) {
 	return "", fmt.Errorf("未找到 tty")
 }
 
-// findAudioDevice 在 USB composite device 下查找 ALSA 声卡
-// 通过遍历 usbPath 下所有接口子目录的 sound/card* 来发现
-// 原理：EC20 的 AT 串口和 USB Audio 属于同一 USB composite device，共享相同的 sysfs 父路径
-func findAudioDevice(usbPath string) (string, int) {
-	usbName := filepath.Base(usbPath)
+func readUSBConfigValue(usbPath string) string {
+	data, err := os.ReadFile(filepath.Join(usbPath, "bConfigurationValue"))
+	if err != nil {
+		return "1"
+	}
+	val := strings.TrimSpace(string(data))
+	if val == "" {
+		return "1"
+	}
+	if n, err := strconv.Atoi(val); err == nil && n > 0 {
+		return strconv.Itoa(n)
+	}
+	return val
+}
 
-	// 遍历所有 USB 接口 (如 1-4:1.0, 1-4:1.1, ... 1-4:1.6)
-	pattern := filepath.Join(usbPath, usbName+":1.*", "sound", "card*")
-	matches, err := filepath.Glob(pattern)
-	if err != nil || len(matches) == 0 {
+func readUSBInterfaceNumber(ifPath string, fallback int) (int, bool) {
+	data, err := os.ReadFile(filepath.Join(ifPath, "bInterfaceNumber"))
+	if err == nil {
+		raw := strings.TrimSpace(string(data))
+		if raw != "" {
+			if parsed, pErr := strconv.ParseUint(raw, 16, 8); pErr == nil {
+				return int(parsed), true
+			}
+			if parsed, pErr := strconv.Atoi(raw); pErr == nil && parsed >= 0 {
+				return parsed, true
+			}
+		}
+	}
+	if fallback >= 0 {
+		return fallback, true
+	}
+	return 0, false
+}
+
+func detectModemBusType(scanUSBPath, ifPath string) string {
+	drv := strings.ToLower(determineDriver(ifPath))
+	if strings.Contains(drv, "mhi") || strings.Contains(drv, "pcie") {
+		return "pcie"
+	}
+	lowerPath := strings.ToLower(scanUSBPath)
+	if strings.Contains(lowerPath, "/mhi") && !strings.Contains(lowerPath, "/usb") {
+		return "pcie"
+	}
+	return "usb"
+}
+
+// findAudioDevice 在 USB composite device 下查找 ALSA 声卡
+func findAudioDevice(usbPath string) (string, int) {
+	return findAudioDeviceWithConfig(usbPath, readUSBConfigValue(usbPath))
+}
+
+func findAudioDeviceWithConfig(usbPath, cfgVal string) (string, int) {
+	usbName := filepath.Base(usbPath)
+	if strings.TrimSpace(cfgVal) == "" {
+		cfgVal = "1"
+	}
+
+	// 遍历当前激活 USB 配置的接口 (如 1-4:2.0..1-4:2.6)，再兜底任意配置
+	patterns := []string{
+		filepath.Join(usbPath, usbName+":"+cfgVal+".*", "sound", "card*"),
+		filepath.Join(usbPath, usbName+":*.*", "sound", "card*"),
+	}
+	var matches []string
+	for _, pattern := range patterns {
+		found, err := filepath.Glob(pattern)
+		if err == nil && len(found) > 0 {
+			matches = found
+			break
+		}
+	}
+	if len(matches) == 0 {
 		return "", -1
 	}
 

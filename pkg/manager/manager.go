@@ -78,9 +78,12 @@ type Config struct {
 	DisableIMSAInd  bool        // Disable IMSA indications / 禁用 IMSA 指示
 	DisableVOICEInd bool        // Disable VOICE indications / 禁用 VOICE 指示
 
-	ProfileIndex uint8 // PDN Profile 索引 (对应 -n 参数, 默认 0 表示使用模组默认 Profile)
-	MuxID        uint8 // QMAP Mux ID (对应 -m 参数, 默认 0 表示不启用多路复用)
-	NoDial       bool  // Only open QMI services, don't perform WDS dialing / 仅打开 QMI 服务, 不进行 WDS 拨号
+	ProfileIndex uint8  // PDN Profile 索引 (对应 -n 参数, 默认 0 表示使用模组默认 Profile)
+	MuxID        uint8  // QMAP Mux ID (对应 -m 参数, 默认 0 表示不启用多路复用)
+	MuxEpType    uint32 // Optional QMAP endpoint type override (0=auto: 0x02 USB / 0x03 PCIe)
+	MuxEpIfID    int    // Optional QMAP endpoint interface number override
+	HasMuxEpIfID bool   // True when MuxEpIfID is explicitly specified (including interface 0)
+	NoDial       bool   // Only open QMI services, don't perform WDS dialing / 仅打开 QMI 服务, 不进行 WDS 拨号
 
 	DataPlanePolicy DataPlanePolicy // Data-plane service allocation policy / 数据面服务分配策略
 	Timeouts        TimeoutConfig
@@ -203,7 +206,8 @@ type Manager struct {
 	regNotify chan bool // For fast registration detection / 用于快速注册检测
 
 	// 多路拨号 (QMAP) / Multi-PDN
-	muxIface string // QMAP 绑定后的虚拟网卡名 (如 qmimux0)
+	muxIface      string // QMAP 绑定后的虚拟网卡名 (如 qmimux0)
+	dnsConfigured bool   // True when resolv.conf was updated for the active session
 
 	timerMu                 sync.Mutex
 	scheduledTimers         map[*time.Timer]struct{}
@@ -257,8 +261,10 @@ type Manager struct {
 	querySignalStrength               func(ctx context.Context) (*qmi.SignalStrength, error)
 	queryServingSystem                func(ctx context.Context) (*qmi.ServingSystem, error)
 	queryPacketServiceState           func(ctx context.Context) (qmi.ConnectionStatus, error)
+	queryWDSPacketServiceStateHook    func(ctx context.Context, wds *qmi.WDSService, family uint8) (qmi.ConnectionStatus, error)
 	queryExistingPacketServiceState   func(ctx context.Context, wds *qmi.WDSService) (qmi.ConnectionStatus, error)
 	stopExistingDataCall              func(ctx context.Context, wds *qmi.WDSService) error
+	bindMuxDataPortHook               func(ctx context.Context, wds *qmi.WDSService, binding qmi.MuxBinding) error
 	closeWDSService                   func(wds *qmi.WDSService) error
 	registerWMSEventReport            func(ctx context.Context) error
 	registerWMSIndications            func(ctx context.Context, reportTransportNetworkRegistration bool) error
@@ -458,6 +464,18 @@ func normalizeConfig(cfg Config) Config {
 		cfg.RecoveryPolicy.ServiceRecoverCooldown = defaultUIMRecoverCooldown
 	}
 	defaultClientOpts := qmi.DefaultClientOptions()
+	isZeroClientOpts := cfg.ClientOptions.ReadDeadline == 0 &&
+		cfg.ClientOptions.DefaultRequestTimeout == 0 &&
+		cfg.ClientOptions.TxQueueSize == 0 &&
+		cfg.ClientOptions.IndicationQueueSize == 0 &&
+		!cfg.ClientOptions.SyncOnOpen &&
+		!cfg.ClientOptions.QueryVersionOnOpen &&
+		!cfg.ClientOptions.UseProxy &&
+		cfg.ClientOptions.ProxyPath == "" &&
+		cfg.ClientOptions.ProxyExecutable == "" &&
+		cfg.ClientOptions.ProxyOpenTimeout == 0 &&
+		cfg.ClientOptions.Logf == nil
+
 	if cfg.ClientOptions.ReadDeadline <= 0 {
 		cfg.ClientOptions.ReadDeadline = defaultClientOpts.ReadDeadline
 	}
@@ -479,12 +497,15 @@ func normalizeConfig(cfg Config) Config {
 	if cfg.ClientOptions.ProxyOpenTimeout <= 0 {
 		cfg.ClientOptions.ProxyOpenTimeout = defaultClientOpts.ProxyOpenTimeout
 	}
-	if !cfg.ClientOptions.SyncOnOpen &&
-		cfg.ClientOptions.ReadDeadline == defaultClientOpts.ReadDeadline &&
-		cfg.ClientOptions.DefaultRequestTimeout == defaultClientOpts.DefaultRequestTimeout &&
-		cfg.ClientOptions.TxQueueSize == defaultClientOpts.TxQueueSize &&
-		cfg.ClientOptions.IndicationQueueSize == defaultClientOpts.IndicationQueueSize {
+	if cfg.ClientOptions.UseProxy {
+		cfg.ClientOptions.SyncOnOpen = false
+	} else if isZeroClientOpts {
 		cfg.ClientOptions.SyncOnOpen = defaultClientOpts.SyncOnOpen
+		cfg.ClientOptions.QueryVersionOnOpen = defaultClientOpts.QueryVersionOnOpen
+	}
+
+	if !cfg.NoDial && cfg.DataPlanePolicy != DataPlanePolicyDisabled && !cfg.EnableIPv4 && !cfg.EnableIPv6 {
+		cfg.EnableIPv4 = true
 	}
 	return cfg
 }
@@ -548,38 +569,76 @@ func (m *Manager) StartCore() error {
 	return m.StartCoreContext(context.Background())
 }
 
+func mergeContexts(a, b context.Context) (context.Context, context.CancelFunc) {
+	if a == nil {
+		a = context.Background()
+	}
+	if b == nil {
+		return context.WithCancel(a)
+	}
+	merged, cancel := context.WithCancel(a)
+	stopAfter := context.AfterFunc(b, cancel)
+	return merged, func() {
+		stopAfter()
+		cancel()
+	}
+}
+
 // StartCoreContext initializes the QMI core services without starting a data call.
 func (m *Manager) StartCoreContext(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctxLoop, cancelLoop := context.WithCancel(context.Background())
+
 	m.mu.Lock()
 	if m.coreReady || m.state != StateDisconnected {
 		m.mu.Unlock()
+		cancelLoop()
 		return fmt.Errorf("manager already started")
 	}
 	m.state = StateConnecting
 	m.desiredConnection = false
+	m.ctx = ctxLoop
+	m.cancel = cancelLoop
+	m.wg.Add(1)
 	m.mu.Unlock()
+
+	startupReleased := false
+	releaseStartup := func() {
+		if !startupReleased {
+			startupReleased = true
+			m.wg.Done()
+		}
+	}
+	defer releaseStartup()
 
 	m.startPending.Store(false)
 	if m.events != nil {
 		m.events.reopen(m.cfg.EventPolicy.CallbackQueueSize)
 	}
 
+	openCtx, cancelOpen := mergeContexts(ctx, ctxLoop)
 	openErr := error(nil)
 	if m.openClientAndAllocateServicesHook != nil {
-		openErr = m.openClientAndAllocateServicesHook(ctx)
+		openErr = m.openClientAndAllocateServicesHook(openCtx)
 	} else {
-		openErr = m.openClientAndAllocateServices(ctx)
+		openErr = m.openClientAndAllocateServices(openCtx)
 	}
+	cancelOpen()
 	if openErr != nil {
-		m.cleanup()
-		if m.events != nil {
-			m.events.Close()
+		cancelLoop()
+		if !m.isStoppingStateOnly() {
+			m.cleanup()
+			if m.events != nil {
+				m.events.Close()
+			}
+			m.setStateIfNotStopping(StateDisconnected)
 		}
-		m.setState(StateDisconnected)
 		return openErr
+	}
+	if m.isStoppingOrCanceled() {
+		return context.Canceled
 	}
 	m.mu.Lock()
 	m.markControlReadyLocked("start_control_ready")
@@ -591,27 +650,44 @@ func (m *Manager) StartCoreContext(ctx context.Context) error {
 		// Continue anyway - might work / 继续尝试，也许能工作
 	}
 
-	// Start event loop / 启动事件循环
-	ctxLoop, cancelLoop := context.WithCancel(context.Background())
-	m.mu.Lock()
-	m.ctx = ctxLoop
-	m.cancel = cancelLoop
-	m.mu.Unlock()
 	m.stopScheduledTimers()
+	m.mu.Lock()
+	if m.state == StateStopping || ctxLoop.Err() != nil {
+		m.mu.Unlock()
+		return context.Canceled
+	}
 	m.wg.Add(2)
 	go m.eventLoop()
 	go m.indicationHandler()
-
-	m.mu.Lock()
 	m.markCoreReadyLocked("start_core_ready")
+	m.state = StateDisconnected
 	m.mu.Unlock()
-	m.setState(StateDisconnected)
+
 	m.log.Info("QMI core started")
+	releaseStartup()
 
 	// 在底层 QMI 就绪后立即在后台异步全量加载设备标识。
 	m.PreWarmIdentities(true)
 
 	return nil
+}
+
+func (m *Manager) isStoppingStateOnly() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.state == StateStopping
+}
+
+func (m *Manager) setStateIfNotStopping(s State) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.state == StateStopping {
+		return
+	}
+	if m.state != s {
+		m.log.Infof("State: %s -> %s", m.state, s)
+		m.state = s
+	}
 }
 
 // Stop gracefully stops the connection manager / Stop 优雅停止连接管理器
@@ -704,39 +780,25 @@ func (m *Manager) Disconnect() error {
 	return nil
 }
 
-func (m *Manager) ResetExistingDataConnection(ctx context.Context) (bool, error) {
-	if ctx == nil {
-		ctx = context.Background()
+func isUnsupportedWDSFamilyError(err error) bool {
+	var qmiErr *qmi.QMIError
+	if !errors.As(err, &qmiErr) || qmiErr == nil {
+		return false
 	}
+	return qmiErr.ErrorCode == qmi.QMIErrInvalidQmiCmd ||
+		qmiErr.ErrorCode == qmi.QMIErrNotSupported ||
+		qmiErr.ErrorCode == qmi.QMIErrInvalidArg ||
+		qmiErr.ErrorCode == qmi.QMIErrOpDeviceUnsupported
+}
 
-	m.dataMu.Lock()
-	defer m.dataMu.Unlock()
-
-	m.mu.RLock()
-	coreReady := m.coreReady
-	client := m.client
-	wds := m.wds
-	m.mu.RUnlock()
-
-	if !coreReady || client == nil {
-		return false, ErrServiceNotReady("qmi-core")
-	}
-
-	temporaryWDS := false
-	if wds == nil {
-		var err error
-		wds, err = m.createWDSServiceWithClient(ctx, client)
-		if err != nil {
-			return false, fmt.Errorf("allocate WDS client for existing data cleanup: %w", err)
-		}
-		temporaryWDS = true
-	}
-	if temporaryWDS {
-		defer func() {
-			if err := m.closeTemporaryWDSService(wds); err != nil {
-				m.log.WithError(err).Warn("Failed to release temporary WDS client after existing data cleanup")
+func (m *Manager) resetExistingFamilyDataCall(ctx context.Context, wds *qmi.WDSService, family uint8) (bool, error) {
+	if wds != nil && wds.HasClient() && m.queryExistingPacketServiceState == nil && m.stopExistingDataCall == nil {
+		if err := wds.SetIPFamilyPreference(ctx, family); err != nil {
+			if family == qmi.IpFamilyV6 && isUnsupportedWDSFamilyError(err) {
+				return false, nil
 			}
-		}()
+			return false, fmt.Errorf("set WDS IP family 0x%02x for existing data cleanup: %w", family, err)
+		}
 	}
 
 	status, err := m.queryExistingPacketServiceStatus(ctx, wds)
@@ -757,6 +819,89 @@ func (m *Manager) ResetExistingDataConnection(ctx context.Context) (bool, error)
 	}
 	if packetServiceStatusHasDataCall(status) {
 		return false, fmt.Errorf("existing qmi data call still connected after stop: %s", status.String())
+	}
+	return true, nil
+}
+
+func (m *Manager) ResetExistingDataConnection(ctx context.Context) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	m.dataMu.Lock()
+	defer m.dataMu.Unlock()
+
+	m.mu.RLock()
+	coreReady := m.coreReady
+	client := m.client
+	wds := m.wds
+	wdsV6 := m.wdsV6
+	m.mu.RUnlock()
+
+	if !coreReady || client == nil {
+		return false, ErrServiceNotReady("qmi-core")
+	}
+
+	baseWDS := wds
+	if baseWDS == nil {
+		baseWDS = wdsV6
+	}
+	temporaryWDS := false
+	if baseWDS == nil {
+		var err error
+		baseWDS, err = m.createWDSServiceWithClient(ctx, client)
+		if err != nil {
+			return false, fmt.Errorf("allocate WDS client for existing data cleanup: %w", err)
+		}
+		temporaryWDS = true
+	}
+	if temporaryWDS {
+		defer func() {
+			if err := m.closeTemporaryWDSService(baseWDS); err != nil {
+				m.log.WithError(err).Warn("Failed to release temporary WDS client after existing data cleanup")
+			}
+		}()
+	}
+
+	useLegacyHooks := m.queryExistingPacketServiceState != nil || m.stopExistingDataCall != nil
+	var resetAny bool
+	if useLegacyHooks {
+		var err error
+		resetAny, err = m.resetExistingFamilyDataCall(ctx, baseWDS, qmi.IpFamilyV4)
+		if err != nil {
+			return false, err
+		}
+	} else {
+		wdsForV4 := wds
+		if wdsForV4 == nil {
+			wdsForV4 = baseWDS
+		}
+		wdsForV6 := wdsV6
+		if wdsForV6 == nil {
+			wdsForV6 = baseWDS
+		}
+
+		resetV4, err := m.resetExistingFamilyDataCall(ctx, wdsForV4, qmi.IpFamilyV4)
+		if err != nil {
+			return false, err
+		}
+		resetV6, err := m.resetExistingFamilyDataCall(ctx, wdsForV6, qmi.IpFamilyV6)
+		if err != nil {
+			if wds != nil && wdsForV6 == wds && wds.HasClient() {
+				_ = wds.SetIPFamilyPreference(ctx, qmi.IpFamilyV4)
+			}
+			return false, err
+		}
+		if wds != nil && wdsForV6 == wds && wds.HasClient() {
+			_ = wds.SetIPFamilyPreference(ctx, qmi.IpFamilyV4)
+		} else if wds == nil && wdsV6 != nil && wdsForV4 == wdsV6 && wdsV6.HasClient() {
+			_ = wdsV6.SetIPFamilyPreference(ctx, qmi.IpFamilyV6)
+		}
+		resetAny = resetV4 || resetV6
+	}
+
+	if !resetAny {
+		return false, nil
 	}
 
 	m.startPending.Store(false)
@@ -957,11 +1102,11 @@ func (m *Manager) IsConnected() bool {
 	return m.state == StateConnected
 }
 
-// Settings returns the current IP settings / Settings 返回当前的 IP 设置
+// Settings returns a deep copy of the current IP settings / Settings 返回当前 IP 设置的深拷贝
 func (m *Manager) Settings() *qmi.RuntimeSettings {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.settings
+	return cloneRuntimeSettings(m.settings)
 }
 
 func (m *Manager) Stats() ManagerStats {
@@ -1077,6 +1222,40 @@ func (m *Manager) getServingSystem(ctx context.Context) (*qmi.ServingSystem, err
 	})
 }
 
+func (m *Manager) queryWDSFamilyStatus(ctx context.Context, wds *qmi.WDSService, family uint8) (qmi.ConnectionStatus, error) {
+	if m.queryWDSPacketServiceStateHook != nil {
+		return m.queryWDSPacketServiceStateHook(ctx, wds, family)
+	}
+	if wds == nil {
+		return qmi.StatusUnknown, fmt.Errorf("wds service not available")
+	}
+	return wds.GetPacketServiceStatus(ctx)
+}
+
+func combinePacketServiceStatuses(statuses ...qmi.ConnectionStatus) qmi.ConnectionStatus {
+	hasDisconnected := false
+	hasTransitional := false
+	transitional := qmi.StatusUnknown
+	for _, st := range statuses {
+		switch st {
+		case qmi.StatusConnected:
+			return qmi.StatusConnected
+		case qmi.StatusAuthenticating, qmi.StatusSuspended:
+			hasTransitional = true
+			transitional = st
+		case qmi.StatusDisconnected:
+			hasDisconnected = true
+		}
+	}
+	if hasTransitional {
+		return transitional
+	}
+	if hasDisconnected {
+		return qmi.StatusDisconnected
+	}
+	return qmi.StatusUnknown
+}
+
 func (m *Manager) getPacketServiceState(ctx context.Context) (qmi.ConnectionStatus, error) {
 	if m.queryPacketServiceState != nil {
 		return m.queryPacketServiceState(ctx)
@@ -1084,14 +1263,39 @@ func (m *Manager) getPacketServiceState(ctx context.Context) (qmi.ConnectionStat
 	m.mu.RLock()
 	wds := m.wds
 	wdsV6 := m.wdsV6
+	checkV4 := wds != nil && (m.cfg.EnableIPv4 || m.handleV4 != 0 || wdsV6 == nil)
+	checkV6 := wdsV6 != nil && (m.cfg.EnableIPv6 || m.handleV6 != 0 || wds == nil)
 	m.mu.RUnlock()
-	if wds != nil {
-		return wds.GetPacketServiceStatus(ctx)
+
+	if !checkV4 && !checkV6 {
+		return qmi.StatusUnknown, fmt.Errorf("wds service not available")
 	}
-	if wdsV6 != nil {
-		return wdsV6.GetPacketServiceStatus(ctx)
+
+	var (
+		statuses []qmi.ConnectionStatus
+		lastErr  error
+	)
+	if checkV4 {
+		if st, err := m.queryWDSFamilyStatus(ctx, wds, qmi.IpFamilyV4); err == nil {
+			statuses = append(statuses, st)
+		} else {
+			lastErr = err
+		}
 	}
-	return qmi.StatusUnknown, fmt.Errorf("wds service not available")
+	if checkV6 {
+		if st, err := m.queryWDSFamilyStatus(ctx, wdsV6, qmi.IpFamilyV6); err == nil {
+			statuses = append(statuses, st)
+		} else {
+			lastErr = err
+		}
+	}
+	if len(statuses) == 0 {
+		if lastErr != nil {
+			return qmi.StatusUnknown, lastErr
+		}
+		return qmi.StatusUnknown, fmt.Errorf("wds service not available")
+	}
+	return combinePacketServiceStatuses(statuses...), nil
 }
 
 func packetServiceStatusHasDataCall(status qmi.ConnectionStatus) bool {
@@ -1969,28 +2173,60 @@ func (m *Manager) recoverWMSStateWithContext(parent context.Context) {
 	})
 }
 
+func (m *Manager) spawnTrackedBackground(fn func(parentCtx context.Context)) bool {
+	if m == nil || fn == nil {
+		return false
+	}
+	m.mu.Lock()
+	if m.state == StateStopping || (m.ctx != nil && m.ctx.Err() != nil) {
+		m.mu.Unlock()
+		return false
+	}
+	parentCtx := m.ctx
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	m.wg.Add(1)
+	m.mu.Unlock()
+
+	go func() {
+		defer m.wg.Done()
+		fn(parentCtx)
+	}()
+	return true
+}
+
 func (m *Manager) maybeRefreshWMSReadiness(reason string) {
 	if !m.hasWMSReadyPath() {
 		return
 	}
 
 	m.mu.Lock()
-	if m.wmsReadinessRefreshPending {
+	if m.wmsReadinessRefreshPending || m.state == StateStopping || (m.ctx != nil && m.ctx.Err() != nil) {
 		m.mu.Unlock()
 		return
 	}
 	m.wmsReadinessRefreshPending = true
+	parentCtx := m.ctx
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	m.wg.Add(1)
 	m.mu.Unlock()
 
 	go func() {
+		defer m.wg.Done()
 		defer func() {
 			m.mu.Lock()
 			m.wmsReadinessRefreshPending = false
 			m.mu.Unlock()
 		}()
 
-		ctx, cancel := m.opContext(m.cfg.Timeouts.StatusCheck)
+		ctx, cancel := contextWithMaxTimeout(parentCtx, m.cfg.Timeouts.StatusCheck)
 		defer cancel()
+		if ctx.Err() != nil {
+			return
+		}
 		m.refreshWMSState(ctx, wmsRefreshOptions{
 			includeRoutes:    true,
 			includeTransport: true,
@@ -2570,24 +2806,33 @@ func (m *Manager) RotateIP() error {
 }
 
 func (m *Manager) dialRotationHandles(ctx context.Context, wds, wdsV6 *qmi.WDSService, wantV4, wantV6 bool) (uint32, uint32, error) {
-	var handleV4, handleV6 uint32
+	var (
+		handleV4, handleV6 uint32
+		v4Err, v6Err       error
+	)
 
 	if wantV4 {
 		h4, err := m.startWDSNetworkInterface(ctx, wds, qmi.IpFamilyV4)
 		if err != nil {
-			return 0, 0, err
+			v4Err = err
+			if !wantV6 {
+				return 0, 0, err
+			}
+			m.log.WithError(err).Warn("IPv4 redial failed during IP rotation; continuing with IPv6")
+		} else {
+			handleV4 = h4
+			m.mu.Lock()
+			m.handleV4 = h4
+			m.mu.Unlock()
 		}
-		handleV4 = h4
-		m.mu.Lock()
-		m.handleV4 = h4
-		m.mu.Unlock()
 	}
 
 	if wantV6 {
 		h6, err := m.startWDSNetworkInterface(ctx, wdsV6, qmi.IpFamilyV6)
 		if err != nil {
-			if !wantV4 {
-				return 0, 0, err
+			v6Err = err
+			if handleV4 == 0 {
+				return 0, 0, errors.Join(v4Err, v6Err)
 			}
 			m.log.WithError(err).Warn("IPv6 redial failed during IP rotation; continuing with IPv4")
 		} else {
@@ -2599,6 +2844,9 @@ func (m *Manager) dialRotationHandles(ctx context.Context, wds, wdsV6 *qmi.WDSSe
 	}
 
 	if handleV4 == 0 && handleV6 == 0 {
+		if joined := errors.Join(v4Err, v6Err); joined != nil {
+			return 0, 0, joined
+		}
 		return 0, 0, fmt.Errorf("no data session established during IP rotation")
 	}
 	return handleV4, handleV6, nil
@@ -2782,10 +3030,16 @@ func (m *Manager) runStartupServiceTasks(ctx context.Context, fatal bool, tasks 
 // hasQMIService 检查底层 Client 是否声明支持该服务。
 // 仅在 client 初始化完成后调用有效。
 func (m *Manager) hasQMIService(service uint8) bool {
-	if m.client == nil {
+	if m == nil {
 		return false
 	}
-	return m.client.HasService(service)
+	m.mu.RLock()
+	client := m.client
+	m.mu.RUnlock()
+	if client == nil {
+		return false
+	}
+	return client.HasService(service)
 }
 
 func (m *Manager) allocateServices(ctx context.Context) error {
@@ -3191,6 +3445,23 @@ func (m *Manager) checkSIM() error {
 	return nil
 }
 
+func (m *Manager) restoreDNSIfNeeded(force bool) {
+	if m == nil || m.cfg.NoDNS {
+		return
+	}
+	m.mu.Lock()
+	wasConfigured := m.dnsConfigured
+	m.dnsConfigured = false
+	m.mu.Unlock()
+
+	if !wasConfigured && !force {
+		return
+	}
+	if err := netcfg.RestoreResolvConf(); err != nil {
+		m.log.WithError(err).Warn("Failed to restore DNS configuration")
+	}
+}
+
 func (m *Manager) cleanup() {
 	// Use timeout context for cleanup operations / 使用超时上下文进行清理操作
 	m.stopScheduledTimers()
@@ -3213,6 +3484,7 @@ func (m *Manager) cleanup() {
 	handleV4 := m.handleV4
 	handleV6 := m.handleV6
 	ifname := m.cfg.Device.NetInterface
+	wasDNSConfigured := m.dnsConfigured
 
 	muxIface := m.muxIface
 	muxID := m.cfg.MuxID
@@ -3234,6 +3506,7 @@ func (m *Manager) cleanup() {
 	m.handleV6 = 0
 	m.settings = nil
 	m.muxIface = ""
+	m.dnsConfigured = false
 	m.markControlNotReadyLocked("cleanup")
 	m.markCoreNotReadyLocked("cleanup", nil)
 	m.wmsTransportStatus = 0
@@ -3255,7 +3528,7 @@ func (m *Manager) cleanup() {
 	m.wmsReadinessRefreshPending = false
 	m.mu.Unlock()
 
-	cleanupTasks := make([]cleanupTask, 0, 4)
+	cleanupTasks := make([]cleanupTask, 0, 5)
 
 	if muxIface != "" && muxID > 0 {
 		cleanupTasks = append(cleanupTasks, cleanupTask{
@@ -3263,6 +3536,7 @@ func (m *Manager) cleanup() {
 			run: func(context.Context) error {
 				return errors.Join(
 					netcfg.FlushAddresses(muxIface),
+					netcfg.FlushRoutes(muxIface),
 					netcfg.BringDown(muxIface),
 					netcfg.DelQMAPMux(masterIface, muxID),
 				)
@@ -3275,6 +3549,12 @@ func (m *Manager) cleanup() {
 		cleanupTasks = append(cleanupTasks, cleanupTask{
 			name: "stop-wds-v4",
 			run: func(ctx context.Context) error {
+				if m.stopWDSNetworkInterfaceHook != nil {
+					return m.stopWDSNetworkInterfaceHook(ctx, wds, handleV4)
+				}
+				if !wds.HasClient() {
+					return nil
+				}
 				return wds.StopNetworkInterface(ctx, handleV4)
 			},
 		})
@@ -3283,7 +3563,22 @@ func (m *Manager) cleanup() {
 		cleanupTasks = append(cleanupTasks, cleanupTask{
 			name: "stop-wds-v6",
 			run: func(ctx context.Context) error {
+				if m.stopWDSNetworkInterfaceHook != nil {
+					return m.stopWDSNetworkInterfaceHook(ctx, wdsV6, handleV6)
+				}
+				if !wdsV6.HasClient() {
+					return nil
+				}
 				return wdsV6.StopNetworkInterface(ctx, handleV6)
+			},
+		})
+	}
+
+	if !m.cfg.NoDNS && (wasDNSConfigured || (m.configureNetworkHook == nil && (handleV4 != 0 || handleV6 != 0))) {
+		cleanupTasks = append(cleanupTasks, cleanupTask{
+			name: "restore-dns",
+			run: func(context.Context) error {
+				return netcfg.RestoreResolvConf()
 			},
 		})
 	}
@@ -3294,6 +3589,7 @@ func (m *Manager) cleanup() {
 			run: func(context.Context) error {
 				return errors.Join(
 					netcfg.FlushAddresses(ifname),
+					netcfg.FlushRoutes(ifname),
 					netcfg.BringDown(ifname),
 				)
 			},
@@ -3499,13 +3795,10 @@ func (m *Manager) openClientAndAllocateServices(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if runtime.GOOS == "linux" {
-		rawIPPath := filepath.Join("/sys/class/net", m.cfg.Device.NetInterface, "qmi/raw_ip")
-		if b, err := os.ReadFile(rawIPPath); err == nil && len(b) > 0 {
-			if b[0] != 'Y' && b[0] != 'y' && b[0] != '1' {
-				if err := os.WriteFile(rawIPPath, []byte("Y"), 0); err != nil {
-					m.log.WithError(err).Warn("Failed to enable kernel raw_ip")
-				}
+	if runtime.GOOS == "linux" && m.shouldAllocateDataPlaneAtStart() && m.shouldAllocateWDA() {
+		if iface := strings.TrimSpace(m.cfg.Device.NetInterface); iface != "" {
+			if err := netcfg.EnableRawIP(iface); err != nil {
+				m.log.WithError(err).Warn("Failed to enable kernel raw_ip")
 			}
 		}
 	}
@@ -3569,12 +3862,15 @@ func (m *Manager) openClientAndAllocateServices(ctx context.Context) error {
 }
 
 func (m *Manager) doRecoverFromModemReset() bool {
+	if m.isStoppingOrCanceled() {
+		return false
+	}
 	m.mu.RLock()
 	desiredConnection := m.desiredConnection
-	isStopping := m.state == StateStopping
+	recoverCtx := m.ctx
 	m.mu.RUnlock()
-	if isStopping {
-		return false
+	if recoverCtx == nil {
+		recoverCtx = context.Background()
 	}
 
 	m.recoverAttempts.Add(1)
@@ -3586,11 +3882,21 @@ func (m *Manager) doRecoverFromModemReset() bool {
 	m.markCoreNotReadyLocked("recover_reinit_services", nil)
 	m.mu.Unlock()
 
+	if m.isStoppingOrCanceled() {
+		return false
+	}
+
 	openErr := error(nil)
 	if m.openClientAndAllocateServicesHook != nil {
-		openErr = m.openClientAndAllocateServicesHook(context.Background())
+		openErr = m.openClientAndAllocateServicesHook(recoverCtx)
 	} else {
-		openErr = m.openClientAndAllocateServices(context.Background())
+		openErr = m.openClientAndAllocateServices(recoverCtx)
+	}
+	if m.isStoppingOrCanceled() {
+		if openErr == nil {
+			m.cleanup()
+		}
+		return false
 	}
 	if openErr != nil {
 		m.log.WithError(openErr).Warn("Failed to reinitialize QMI after modem reset")
@@ -3598,11 +3904,13 @@ func (m *Manager) doRecoverFromModemReset() bool {
 		m.markControlNotReadyLocked("recover_reinit_services")
 		m.markCoreNotReadyLocked("recover_reinit_services", openErr)
 		m.mu.Unlock()
-		m.setState(StateDisconnected)
+		m.setStateIfNotStopping(StateDisconnected)
 		if m.isControlDeviceGone() {
 			m.log.WithError(openErr).Warn("Control device node missing; emitting device_removed terminal event")
+			m.mu.Lock()
 			m.recoverCount = 0
 			m.recoverFirstFailAt = time.Time{}
+			m.mu.Unlock()
 			m.emitEvent(Event{Type: EventRecoveryExhausted, State: StateDisconnected, Error: openErr, Reason: "device_removed"})
 			return false
 		}
@@ -3622,6 +3930,10 @@ func (m *Manager) doRecoverFromModemReset() bool {
 	if checkSIMErr != nil {
 		m.log.WithError(checkSIMErr).Warn("SIM check failed after modem reset")
 	}
+	if m.isStoppingOrCanceled() {
+		m.cleanup()
+		return false
+	}
 
 	m.mu.Lock()
 	m.markCoreNotReadyLocked("recover_wait_reset_quiet", nil)
@@ -3629,6 +3941,10 @@ func (m *Manager) doRecoverFromModemReset() bool {
 	quietCtx, quietCancel := m.opContext(m.modemResetQuietWindow + time.Second)
 	quietErr := m.waitResetQuietWindow(quietCtx)
 	quietCancel()
+	if m.isStoppingOrCanceled() {
+		m.cleanup()
+		return false
+	}
 	if quietErr != nil {
 		m.mu.Lock()
 		m.markCoreNotReadyLocked("recover_wait_reset_quiet", quietErr)
@@ -3650,19 +3966,31 @@ func (m *Manager) doRecoverFromModemReset() bool {
 	identityCtx, identityCancel := m.opContext(identityTimeout)
 	identityErr := m.waitIdentityReadable(identityCtx)
 	identityCancel()
+	if m.isStoppingOrCanceled() {
+		m.cleanup()
+		return false
+	}
 	if identityErr != nil {
 		m.log.WithError(identityErr).Warn("QMI identity gate not satisfied after reset recovery (core recovery proceeds anyway)")
 	}
 
+	m.mu.Lock()
+	if m.state == StateStopping || (m.ctx != nil && m.ctx.Err() != nil) {
+		m.mu.Unlock()
+		m.cleanup()
+		return false
+	}
 	m.recoverCount = 0
 	m.recoverFirstFailAt = time.Time{}
+	m.markCoreReadyLocked("recover_converged")
+	if m.state != StateStopping {
+		m.state = StateDisconnected
+	}
+	m.mu.Unlock()
+
 	m.recoverBackoffMs.Store(0)
 	m.recoverSuccess.Add(1)
 
-	m.mu.Lock()
-	m.markCoreReadyLocked("recover_converged")
-	m.mu.Unlock()
-	m.setState(StateDisconnected)
 	if desiredConnection && m.cfg.AutoReconnect {
 		m.scheduleAfter(2*time.Second, func() {
 			m.requestStart()
@@ -3757,6 +4085,12 @@ func (m *Manager) isControlDeviceGone() bool {
 
 // recoveryExhausted 判断核心恢复是否应放弃重试（仅在策略启用时返回 true）。
 func (m *Manager) recoveryExhausted() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.recoveryExhaustedLocked()
+}
+
+func (m *Manager) recoveryExhaustedLocked() bool {
 	p := m.cfg.RecoveryPolicy
 	if p.MaxRecoverAttempts > 0 && m.recoverCount > p.MaxRecoverAttempts {
 		return true
@@ -3769,28 +4103,44 @@ func (m *Manager) recoveryExhausted() bool {
 }
 
 func (m *Manager) scheduleRecoverRetry(reason string) {
+	if m.isStoppingOrCanceled() {
+		return
+	}
+	m.mu.Lock()
 	m.recoverCount++
 	if m.recoverFirstFailAt.IsZero() {
 		m.recoverFirstFailAt = time.Now()
 	}
-	if m.recoveryExhausted() {
-		m.log.WithField("reason", reason).
-			WithField("attempts", m.recoverCount).
-			Warn("Core recovery exhausted; emitting terminal event and stopping retries")
+	attempt := m.recoverCount
+	exhausted := m.recoveryExhaustedLocked()
+	if exhausted {
 		m.recoverCount = 0
 		m.recoverFirstFailAt = time.Time{}
+	}
+	m.mu.Unlock()
+
+	if exhausted {
+		m.log.WithField("reason", reason).
+			WithField("attempts", attempt).
+			Warn("Core recovery exhausted; emitting terminal event and stopping retries")
 		m.emitEvent(Event{Type: EventRecoveryExhausted, State: StateDisconnected, Reason: "recovery_exhausted"})
 		return
 	}
-	delay := m.getRecoverDelay()
-	m.log.WithField("reason", reason).Infof("Will retry reinit with backoff in %v (attempt=%d)", delay, m.recoverCount)
+	delay := m.getRecoverDelayForAttempt(attempt)
+	m.log.WithField("reason", reason).Infof("Will retry reinit with backoff in %v (attempt=%d)", delay, attempt)
 	m.scheduleAfter(delay, func() {
 		m.enqueueModemResetEvent("recover_retry")
 	})
 }
 
 func (m *Manager) getRecoverDelay() time.Duration {
+	m.mu.RLock()
 	attempt := m.recoverCount
+	m.mu.RUnlock()
+	return m.getRecoverDelayForAttempt(attempt)
+}
+
+func (m *Manager) getRecoverDelayForAttempt(attempt int) time.Duration {
 	if attempt <= 0 {
 		attempt = 1
 	}
@@ -3840,6 +4190,85 @@ func jitteredFullCheckInterval(base time.Duration) time.Duration {
 	return result
 }
 
+func (m *Manager) resolveMuxBinding() qmi.MuxBinding {
+	epType := uint32(0x02) // HSUSB
+	busType := strings.ToLower(strings.TrimSpace(m.cfg.Device.BusType))
+	if busType == "pcie" || busType == "mhi" {
+		epType = 0x03 // PCIE / MHI
+	}
+	if m.cfg.MuxEpType > 0 {
+		epType = m.cfg.MuxEpType
+	}
+
+	epIfID := uint32(0x04) // Legacy Quectel USB QMI interface fallback
+	if m.cfg.HasMuxEpIfID || m.cfg.MuxEpIfID > 0 {
+		epIfID = uint32(m.cfg.MuxEpIfID)
+	} else if m.cfg.Device.HasInterfaceNumber || m.cfg.Device.InterfaceNumber > 0 {
+		epIfID = uint32(m.cfg.Device.InterfaceNumber)
+	}
+
+	return qmi.MuxBinding{
+		EpType:     epType,
+		EpIfID:     epIfID,
+		MuxID:      m.cfg.MuxID,
+		ClientType: 1, // Tethered
+	}
+}
+
+func (m *Manager) bindWDSMuxDataPort(ctx context.Context, wds *qmi.WDSService, binding qmi.MuxBinding) error {
+	if m.bindMuxDataPortHook != nil {
+		return m.bindMuxDataPortHook(ctx, wds, binding)
+	}
+	if wds == nil {
+		return fmt.Errorf("wds service not available")
+	}
+	if !wds.HasClient() && m.startWDSNetworkInterfaceHook != nil {
+		return nil
+	}
+	return wds.BindMuxDataPort(ctx, binding)
+}
+
+func collectRuntimeDNSServers(settings *qmi.RuntimeSettings) []string {
+	if settings == nil {
+		return nil
+	}
+	candidates := []net.IP{
+		settings.IPv4DNS1,
+		settings.IPv4DNS2,
+		settings.IPv6DNS1,
+		settings.IPv6DNS2,
+	}
+	out := make([]string, 0, len(candidates))
+	seen := make(map[string]struct{}, len(candidates))
+	for _, ip := range candidates {
+		if len(ip) == 0 || ip.IsUnspecified() {
+			continue
+		}
+		s := ip.String()
+		if s == "" {
+			continue
+		}
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+func containsIP(ips []net.IP, target net.IP) bool {
+	if len(target) == 0 {
+		return false
+	}
+	for _, ip := range ips {
+		if ip != nil && ip.Equal(target) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) doConnect() error {
 	m.dataMu.Lock()
 	defer m.dataMu.Unlock()
@@ -3882,7 +4311,12 @@ func (m *Manager) doConnect() error {
 
 	// ========== 多路拨号 (QMAP) 准备 ==========
 	if m.cfg.MuxID > 0 {
-		masterIface := m.cfg.Device.NetInterface
+		masterIface := strings.TrimSpace(m.cfg.Device.NetInterface)
+		if masterIface == "" {
+			err := fmt.Errorf("master NetInterface required for QMAP MuxID=%d", m.cfg.MuxID)
+			m.handleDialFailure(err)
+			return err
+		}
 		m.log.Infof("多路拨号模式: MuxID=%d, ProfileIndex=%d, 物理网卡=%s",
 			m.cfg.MuxID, m.cfg.ProfileIndex, masterIface)
 
@@ -3894,46 +4328,48 @@ func (m *Manager) doConnect() error {
 		// 2. 创建 QMAP 虚拟网卡 (如果不存在)
 		muxIfname, err := netcfg.AddQMAPMux(masterIface, m.cfg.MuxID)
 		if err != nil {
-			m.log.WithError(err).Errorf("创建 MUX ID=%d 虚拟网卡失败", m.cfg.MuxID)
 			if existing := netcfg.GetQMAPMuxIface(masterIface, m.cfg.MuxID); existing != "" {
-				m.mu.Lock()
-				m.muxIface = existing
-				m.mu.Unlock()
+				muxIfname = existing
+			} else {
+				muxErr := fmt.Errorf("创建 MUX ID=%d 虚拟网卡失败: %w", m.cfg.MuxID, err)
+				m.log.WithError(muxErr).Error("创建 QMAP 虚拟网卡失败")
+				m.handleDialFailure(muxErr)
+				return muxErr
 			}
-		} else {
-			m.log.Infof("QMAP 虚拟网卡: %s (MuxID=%d)", muxIfname, m.cfg.MuxID)
-			m.mu.Lock()
-			m.muxIface = muxIfname
-			m.mu.Unlock()
 		}
+		m.log.Infof("QMAP 虚拟网卡: %s (MuxID=%d)", muxIfname, m.cfg.MuxID)
+		m.mu.Lock()
+		m.muxIface = muxIfname
+		m.mu.Unlock()
 
 		// 3. 绑定 WDS Client 到 Mux Data Port
-		binding := qmi.MuxBinding{
-			EpType:     0x02, // HSUSB
-			EpIfID:     0x04, // 默认 Interface ID
-			MuxID:      m.cfg.MuxID,
-			ClientType: 1, // Tethered
-		}
-		if wds != nil {
+		binding := m.resolveMuxBinding()
+		if m.cfg.EnableIPv4 && wds != nil {
 			ctx, cancel := m.opContext(m.cfg.Timeouts.Dial)
-			if err := wds.BindMuxDataPort(ctx, binding); err != nil {
-				m.log.WithError(err).Error("WDS IPv4 BindMuxDataPort 失败")
-				// 非致命，继续
-			} else {
-				m.log.Infof("WDS IPv4 已绑定 MuxID=%d", m.cfg.MuxID)
-			}
+			bindErr := m.bindWDSMuxDataPort(ctx, wds, binding)
 			cancel()
+			if bindErr != nil {
+				wrapped := fmt.Errorf("WDS IPv4 BindMuxDataPort (MuxID=%d, EpType=%d, EpIfID=%d) failed: %w",
+					m.cfg.MuxID, binding.EpType, binding.EpIfID, bindErr)
+				m.log.WithError(wrapped).Error("WDS IPv4 BindMuxDataPort 失败")
+				m.handleDialFailure(wrapped)
+				return wrapped
+			}
+			m.log.Infof("WDS IPv4 已绑定 MuxID=%d (EpType=%d, EpIfID=%d)", m.cfg.MuxID, binding.EpType, binding.EpIfID)
 		}
 
-		// 如果有 IPv6 WDS，也需要绑定
-		if wdsV6 != nil {
+		if m.cfg.EnableIPv6 && wdsV6 != nil {
 			ctx, cancel := m.opContext(m.cfg.Timeouts.Dial)
-			if err := wdsV6.BindMuxDataPort(ctx, binding); err != nil {
-				m.log.WithError(err).Warn("WDS IPv6 BindMuxDataPort 失败")
-			} else {
-				m.log.Infof("WDS IPv6 已绑定 MuxID=%d", m.cfg.MuxID)
-			}
+			bindErr := m.bindWDSMuxDataPort(ctx, wdsV6, binding)
 			cancel()
+			if bindErr != nil {
+				wrapped := fmt.Errorf("WDS IPv6 BindMuxDataPort (MuxID=%d, EpType=%d, EpIfID=%d) failed: %w",
+					m.cfg.MuxID, binding.EpType, binding.EpIfID, bindErr)
+				m.log.WithError(wrapped).Error("WDS IPv6 BindMuxDataPort 失败")
+				m.handleDialFailure(wrapped)
+				return wrapped
+			}
+			m.log.Infof("WDS IPv6 已绑定 MuxID=%d (EpType=%d, EpIfID=%d)", m.cfg.MuxID, binding.EpType, binding.EpIfID)
 		}
 	}
 
@@ -3973,43 +4409,74 @@ func (m *Manager) doConnect() error {
 		m.log.WithError(regErr).Debug("Failed to query registration state before dialing")
 	}
 
+	var (
+		v4DialErr error
+		v6DialErr error
+	)
+
 	// Start IPv4 data call / 启动IPv4数据呼叫
 	if m.cfg.EnableIPv4 {
 		if wds == nil {
-			err := fmt.Errorf("wds IPv4 service not available")
-			m.handleDialFailure(err)
-			return err
+			v4DialErr = fmt.Errorf("wds IPv4 service not available")
+			if !m.cfg.EnableIPv6 {
+				m.handleDialFailure(v4DialErr)
+				return v4DialErr
+			}
+			m.log.WithError(v4DialErr).Warn("IPv4 WDS unavailable, attempting IPv6")
+		} else {
+			m.log.Info("Starting IPv4 data call...")
+			handle, err := m.startWDSNetworkInterface(dialCtx, wds, qmi.IpFamilyV4)
+			if err != nil {
+				v4DialErr = err
+				if !m.cfg.EnableIPv6 {
+					m.log.WithError(err).Error("IPv4 dial failed")
+					m.handleDialFailure(err)
+					return err
+				}
+				m.log.WithError(err).Warn("IPv4 dial failed, continuing with IPv6")
+			} else {
+				m.mu.Lock()
+				m.handleV4 = handle
+				m.mu.Unlock()
+				m.log.Infof("IPv4 connected, handle=0x%08x", handle)
+			}
 		}
-		m.log.Info("Starting IPv4 data call...")
-		handle, err := m.startWDSNetworkInterface(dialCtx, wds, qmi.IpFamilyV4)
-		if err != nil {
-			m.log.WithError(err).Error("IPv4 dial failed")
-			m.handleDialFailure(err)
-			return err
-		}
-		m.mu.Lock()
-		m.handleV4 = handle
-		m.mu.Unlock()
-		m.log.Infof("IPv4 connected, handle=0x%08x", handle)
 	}
 
 	// Start IPv6 data call / 启动IPv6数据呼叫
-	if m.cfg.EnableIPv6 && wdsV6 != nil {
-		m.log.Info("Starting IPv6 data call...")
-		handle, err := m.startWDSNetworkInterface(dialCtx, wdsV6, qmi.IpFamilyV6)
-		if err != nil {
-			if !m.cfg.EnableIPv4 {
-				m.log.WithError(err).Error("IPv6 dial failed")
-				m.handleDialFailure(err)
-				return err
+	if m.cfg.EnableIPv6 {
+		if wdsV6 == nil {
+			v6DialErr = fmt.Errorf("wds IPv6 service not available")
+			m.mu.RLock()
+			hasV4 := m.handleV4 != 0
+			m.mu.RUnlock()
+			if !hasV4 {
+				dialErr := errors.Join(v4DialErr, v6DialErr)
+				m.handleDialFailure(dialErr)
+				return dialErr
 			}
-			m.log.WithError(err).Warn("IPv6 dial failed")
-			// Continue with IPv4 only
+			m.log.WithError(v6DialErr).Warn("IPv6 WDS unavailable, continuing with IPv4")
 		} else {
-			m.mu.Lock()
-			m.handleV6 = handle
-			m.mu.Unlock()
-			m.log.Infof("IPv6 connected, handle=0x%08x", handle)
+			m.log.Info("Starting IPv6 data call...")
+			handle, err := m.startWDSNetworkInterface(dialCtx, wdsV6, qmi.IpFamilyV6)
+			if err != nil {
+				v6DialErr = err
+				m.mu.RLock()
+				hasV4 := m.handleV4 != 0
+				m.mu.RUnlock()
+				if !hasV4 {
+					dialErr := errors.Join(v4DialErr, v6DialErr)
+					m.log.WithError(dialErr).Error("IPv6 dial failed")
+					m.handleDialFailure(dialErr)
+					return dialErr
+				}
+				m.log.WithError(err).Warn("IPv6 dial failed, continuing with IPv4")
+			} else {
+				m.mu.Lock()
+				m.handleV6 = handle
+				m.mu.Unlock()
+				m.log.Infof("IPv6 connected, handle=0x%08x", handle)
+			}
 		}
 	}
 
@@ -4017,9 +4484,12 @@ func (m *Manager) doConnect() error {
 	hasActiveHandle := m.handleV4 != 0 || m.handleV6 != 0
 	m.mu.RUnlock()
 	if (m.cfg.EnableIPv4 || m.cfg.EnableIPv6) && !hasActiveHandle {
-		err := fmt.Errorf("no data call handle established")
-		m.handleDialFailure(err)
-		return err
+		dialErr := errors.Join(v4DialErr, v6DialErr)
+		if dialErr == nil {
+			dialErr = fmt.Errorf("no data call handle established")
+		}
+		m.handleDialFailure(dialErr)
+		return dialErr
 	}
 
 	// Get IP settings and configure interface / 获取IP设置并配置接口
@@ -4078,12 +4548,17 @@ func (m *Manager) configureNetwork() error {
 
 	var (
 		configuredAny bool
+		mtuConfigured bool
 		v4ConfigErr   error
 		v6ConfigErr   error
 	)
 
+	m.mu.Lock()
+	m.settings = nil
+	m.mu.Unlock()
+
 	// 1. IPv4 Configuration / 1. IPv4配置
-	if wds != nil && (handleV4 != 0 || handleV6 == 0) {
+	if wds != nil && (handleV4 != 0 || (m.cfg.EnableIPv4 && handleV6 == 0)) {
 		m.log.Debug("Querying IPv4 runtime settings...")
 		ctx, cancel := m.opContext(m.cfg.Timeouts.StatusCheck)
 		settings, err := m.getWDSRuntimeSettings(ctx, wds, qmi.IpFamilyV4)
@@ -4095,7 +4570,7 @@ func (m *Manager) configureNetwork() error {
 			}
 		} else if settings != nil {
 			m.mu.Lock()
-			m.settings = settings
+			m.settings = cloneRuntimeSettings(settings)
 			m.mu.Unlock()
 
 			if settings.IPv4Address != nil {
@@ -4116,7 +4591,7 @@ func (m *Manager) configureNetwork() error {
 
 				// Add default route (unless disabled) / 添加默认路由 (除非被禁用)
 				if !m.cfg.NoRoute {
-					if settings.IPv4Gateway != nil && !settings.IPv4Gateway.Equal(net.IPv4zero) {
+					if settings.IPv4Gateway != nil && !settings.IPv4Gateway.IsUnspecified() {
 						m.log.Infof("Adding IPv4 route via %s", settings.IPv4Gateway)
 						if err := netcfg.AddDefaultRoute(ifname, settings.IPv4Gateway); err != nil {
 							m.log.WithError(err).Error("Failed to add IPv4 default route")
@@ -4129,34 +4604,18 @@ func (m *Manager) configureNetwork() error {
 					m.log.Info("Skipping default route (--no-route)")
 				}
 
-				if !m.cfg.NoDNS {
-					dns1 := ""
-					dns2 := ""
-					if settings.IPv4DNS1 != nil {
-						dns1 = settings.IPv4DNS1.String()
-					}
-					if settings.IPv4DNS2 != nil {
-						dns2 = settings.IPv4DNS2.String()
-					}
-					if dns1 != "" {
-						m.log.Infof("Configuring DNS: %s, %s", dns1, dns2)
-						_ = netcfg.UpdateResolvConf(dns1, dns2)
-					}
-				} else {
-					m.log.Info("Skipping DNS configuration (--no-dns)")
-				}
-
 				// Set MTU
 				if settings.MTU > 0 {
 					m.log.Infof("Setting MTU: %d", settings.MTU)
 					_ = netcfg.SetMTU(ifname, int(settings.MTU))
+					mtuConfigured = true
 				}
 			}
 		}
 	}
 
 	// 2. IPv6 Configuration / 2. IPv6配置
-	if wdsV6 != nil && (handleV6 != 0 || handleV4 == 0) {
+	if wdsV6 != nil && (handleV6 != 0 || (m.cfg.EnableIPv6 && handleV4 == 0)) {
 		m.log.Debug("Querying IPv6 runtime settings...")
 		ctx, cancel := m.opContext(m.cfg.Timeouts.StatusCheck)
 		settingsV6, err := m.getWDSRuntimeSettings(ctx, wdsV6, qmi.IpFamilyV6)
@@ -4169,37 +4628,56 @@ func (m *Manager) configureNetwork() error {
 		} else if settingsV6 != nil {
 			// Merge IPv6 fields into m.settings so Settings() exposes both
 			// families regardless of whether the IPv4 leg is active.
-			// IPv6需要合并进m.settings，这样无论IPv4是否启用，Settings()都能返回双栈信息。
 			m.mu.Lock()
 			if m.settings == nil {
 				m.settings = &qmi.RuntimeSettings{}
 			}
-			m.settings.IPv6Address = settingsV6.IPv6Address
+			if settingsV6.IPv6Address != nil {
+				m.settings.IPv6Address = append(net.IP(nil), settingsV6.IPv6Address...)
+			}
 			m.settings.IPv6Prefix = settingsV6.IPv6Prefix
-			m.settings.IPv6Gateway = settingsV6.IPv6Gateway
-			m.settings.IPv6DNS1 = settingsV6.IPv6DNS1
-			m.settings.IPv6DNS2 = settingsV6.IPv6DNS2
+			if settingsV6.IPv6Gateway != nil {
+				m.settings.IPv6Gateway = append(net.IP(nil), settingsV6.IPv6Gateway...)
+			}
+			if settingsV6.IPv6DNS1 != nil {
+				m.settings.IPv6DNS1 = append(net.IP(nil), settingsV6.IPv6DNS1...)
+			}
+			if settingsV6.IPv6DNS2 != nil {
+				m.settings.IPv6DNS2 = append(net.IP(nil), settingsV6.IPv6DNS2...)
+			}
 			if m.settings.MTU == 0 {
 				m.settings.MTU = settingsV6.MTU
 			}
 			m.mu.Unlock()
 
 			if settingsV6.IPv6Address != nil {
-				m.log.Infof("Configuring IPv6: %s/%d", settingsV6.IPv6Address, settingsV6.IPv6Prefix)
-				if err := netcfg.SetIPv6Address(ifname, settingsV6.IPv6Address, int(settingsV6.IPv6Prefix)); err != nil {
+				prefixV6 := int(settingsV6.IPv6Prefix)
+				if prefixV6 <= 0 {
+					prefixV6 = 64
+				}
+				m.log.Infof("Configuring IPv6: %s/%d (DNS: %v, %v)",
+					settingsV6.IPv6Address, prefixV6, settingsV6.IPv6DNS1, settingsV6.IPv6DNS2)
+				if err := netcfg.SetIPv6Address(ifname, settingsV6.IPv6Address, prefixV6); err != nil {
 					m.log.WithError(err).Error("Failed to set IPv6 address")
 					v6ConfigErr = fmt.Errorf("set IPv6 address on %s: %w", ifname, err)
 				} else {
 					configuredAny = true
 				}
 				if !m.cfg.NoRoute {
-					if settingsV6.IPv6Gateway != nil {
+					if settingsV6.IPv6Gateway != nil && !settingsV6.IPv6Gateway.IsUnspecified() {
 						m.log.Infof("Adding IPv6 route via %s", settingsV6.IPv6Gateway)
-						_ = netcfg.AddDefaultRoute(ifname, settingsV6.IPv6Gateway)
+						if err := netcfg.AddDefaultRoute(ifname, settingsV6.IPv6Gateway); err != nil {
+							m.log.WithError(err).Error("Failed to add IPv6 default route")
+						}
 					} else {
 						m.log.Info("Adding direct IPv6 default route")
 						_ = netcfg.AddDefaultRouteDirect(ifname, true)
 					}
+				}
+				if !mtuConfigured && settingsV6.MTU > 0 {
+					m.log.Infof("Setting MTU: %d", settingsV6.MTU)
+					_ = netcfg.SetMTU(ifname, int(settingsV6.MTU))
+					mtuConfigured = true
 				}
 			}
 		}
@@ -4207,6 +4685,25 @@ func (m *Manager) configureNetwork() error {
 
 	if (handleV4 != 0 || handleV6 != 0) && !configuredAny && (v4ConfigErr != nil || v6ConfigErr != nil) {
 		return errors.Join(v4ConfigErr, v6ConfigErr)
+	}
+
+	// 3. Unified IPv4 + IPv6 DNS Configuration
+	if !m.cfg.NoDNS {
+		m.mu.RLock()
+		dnsServers := collectRuntimeDNSServers(m.settings)
+		m.mu.RUnlock()
+		if len(dnsServers) > 0 {
+			m.log.Infof("Configuring DNS: %s", strings.Join(dnsServers, ", "))
+			if err := netcfg.UpdateResolvConfServers(dnsServers...); err != nil {
+				m.log.WithError(err).Warn("Failed to configure DNS")
+			} else {
+				m.mu.Lock()
+				m.dnsConfigured = true
+				m.mu.Unlock()
+			}
+		}
+	} else {
+		m.log.Info("Skipping DNS configuration (--no-dns)")
 	}
 
 	// Final check: ensure up / 最后检查: 确保接口已启动
@@ -4225,6 +4722,10 @@ func (m *Manager) doDisconnect() {
 	ctx, cancel := m.opContext(m.cfg.Timeouts.Stop)
 	defer cancel()
 
+	m.mu.RLock()
+	hadHandles := m.handleV4 != 0 || m.handleV6 != 0
+	m.mu.RUnlock()
+
 	m.stopActiveDataHandles(ctx)
 
 	if targetIface := m.activeNetInterface(); targetIface != "" {
@@ -4232,6 +4733,8 @@ func (m *Manager) doDisconnect() {
 		_ = netcfg.FlushRoutes(targetIface)
 		_ = netcfg.BringDown(targetIface)
 	}
+
+	m.restoreDNSIfNeeded(m.configureNetworkHook == nil && hadHandles)
 
 	m.mu.Lock()
 	m.settings = nil
@@ -4241,6 +4744,113 @@ func (m *Manager) doDisconnect() {
 
 	// Emit disconnected event / 发送断开连接事件
 	m.emitEvent(Event{Type: EventDisconnected, State: StateDisconnected})
+}
+
+func (m *Manager) reconcileDualStackFamilyDrops(ctx context.Context) (qmi.ConnectionStatus, error) {
+	if m.queryPacketServiceState != nil {
+		return m.queryPacketServiceState(ctx)
+	}
+
+	m.mu.RLock()
+	wds := m.wds
+	wdsV6 := m.wdsV6
+	handleV4 := m.handleV4
+	handleV6 := m.handleV6
+	currentState := m.state
+	checkV4 := wds != nil && (m.cfg.EnableIPv4 || handleV4 != 0 || wdsV6 == nil)
+	checkV6 := wdsV6 != nil && (m.cfg.EnableIPv6 || handleV6 != 0 || wds == nil)
+	m.mu.RUnlock()
+
+	if !checkV4 && !checkV6 {
+		return qmi.StatusUnknown, fmt.Errorf("wds service not available")
+	}
+
+	var (
+		statuses []qmi.ConnectionStatus
+		stV4     qmi.ConnectionStatus
+		errV4    error
+		stV6     qmi.ConnectionStatus
+		errV6    error
+		lastErr  error
+	)
+
+	if checkV4 {
+		stV4, errV4 = m.queryWDSFamilyStatus(ctx, wds, qmi.IpFamilyV4)
+		if errV4 == nil {
+			statuses = append(statuses, stV4)
+		} else {
+			lastErr = errV4
+		}
+	}
+	if checkV6 {
+		stV6, errV6 = m.queryWDSFamilyStatus(ctx, wdsV6, qmi.IpFamilyV6)
+		if errV6 == nil {
+			statuses = append(statuses, stV6)
+		} else {
+			lastErr = errV6
+		}
+	}
+	if len(statuses) == 0 {
+		if lastErr != nil {
+			return qmi.StatusUnknown, lastErr
+		}
+		return qmi.StatusUnknown, fmt.Errorf("wds service not available")
+	}
+
+	combined := combinePacketServiceStatuses(statuses...)
+
+	// If overall connection stays up in dual-stack mode while one active family dropped,
+	// release ONLY the dropped family's handle and runtime fields without flushing the surviving family's IPs.
+	if currentState == StateConnected && combined == qmi.StatusConnected {
+		v4Dropped := checkV4 && errV4 == nil && stV4 == qmi.StatusDisconnected && handleV4 != 0
+		v6Dropped := checkV6 && errV6 == nil && stV6 == qmi.StatusDisconnected && handleV6 != 0
+		if v4Dropped || v6Dropped {
+			m.dataMu.Lock()
+			stopCtx, cancelStop := m.opContext(m.cfg.Timeouts.Stop)
+			m.mu.Lock()
+			var dropHandleV4, dropHandleV6 uint32
+			if v4Dropped && m.handleV4 != 0 {
+				dropHandleV4 = m.handleV4
+				m.handleV4 = 0
+				if m.settings != nil {
+					m.settings.IPv4Address = nil
+					m.settings.IPv4Subnet = nil
+					m.settings.IPv4Gateway = nil
+					m.settings.IPv4DNS1 = nil
+					m.settings.IPv4DNS2 = nil
+				}
+			}
+			if v6Dropped && m.handleV6 != 0 {
+				dropHandleV6 = m.handleV6
+				m.handleV6 = 0
+				if m.settings != nil {
+					m.settings.IPv6Address = nil
+					m.settings.IPv6Prefix = 0
+					m.settings.IPv6Gateway = nil
+					m.settings.IPv6DNS1 = nil
+					m.settings.IPv6DNS2 = nil
+				}
+			}
+			m.mu.Unlock()
+
+			if dropHandleV4 != 0 && wds != nil {
+				m.log.Warn("Dual-stack IPv4 leg dropped while IPv6 remains active; cleaning up IPv4 handle")
+				if stopErr := m.stopWDSNetworkInterface(stopCtx, wds, dropHandleV4); stopErr != nil && !isExistingDataStopNoopError(stopErr) {
+					m.log.WithError(stopErr).Debug("Failed to stop dropped IPv4 handle")
+				}
+			}
+			if dropHandleV6 != 0 && wdsV6 != nil {
+				m.log.Warn("Dual-stack IPv6 leg dropped while IPv4 remains active; cleaning up IPv6 handle")
+				if stopErr := m.stopWDSNetworkInterface(stopCtx, wdsV6, dropHandleV6); stopErr != nil && !isExistingDataStopNoopError(stopErr) {
+					m.log.WithError(stopErr).Debug("Failed to stop dropped IPv6 handle")
+				}
+			}
+			cancelStop()
+			m.dataMu.Unlock()
+		}
+	}
+
+	return combined, nil
 }
 
 func (m *Manager) doStatusCheck(full bool) {
@@ -4281,7 +4891,7 @@ func (m *Manager) doStatusCheck(full bool) {
 	}
 
 	// 2. Query connection status / 2. 查询连接状态
-	status, err := m.getPacketServiceState(ctx)
+	status, err := m.reconcileDualStackFamilyDrops(ctx)
 	if err != nil {
 		m.log.WithError(err).Debug("Status query failed")
 		return
@@ -4331,14 +4941,19 @@ func (m *Manager) doStatusCheck(full bool) {
 		if currentState == StateConnected {
 			m.log.Warn("Connection lost!")
 			m.dataMu.Lock()
-			m.mu.Lock()
-			m.handleV4 = 0
-			m.handleV6 = 0
-			m.settings = nil
-			m.mu.Unlock()
+			m.mu.RLock()
+			hadHandles := m.handleV4 != 0 || m.handleV6 != 0
+			m.mu.RUnlock()
+
+			stopCtx, cancelStop := m.opContext(m.cfg.Timeouts.Stop)
+			m.stopActiveDataHandles(stopCtx)
+			cancelStop()
+
 			if targetIface := m.activeNetInterface(); targetIface != "" {
 				_ = netcfg.FlushAddresses(targetIface)
+				_ = netcfg.FlushRoutes(targetIface)
 			}
+			m.restoreDNSIfNeeded(m.configureNetworkHook == nil && hadHandles)
 			m.setState(StateDisconnected)
 			m.dataMu.Unlock()
 			m.emitEvent(Event{Type: EventDisconnected, State: StateDisconnected})
@@ -4359,28 +4974,56 @@ func (m *Manager) doStatusCheck(full bool) {
 func (m *Manager) verifyIPConsistency() error {
 	m.mu.RLock()
 	wds := m.wds
+	wdsV6 := m.wdsV6
 	recorded := cloneRuntimeSettings(m.settings)
 	m.mu.RUnlock()
 
-	if wds == nil || recorded == nil || recorded.IPv4Address == nil {
+	if recorded == nil || (recorded.IPv4Address == nil && recorded.IPv6Address == nil) {
 		return nil
 	}
 
-	// Get fresh settings from modem / 从 modem获取最新设置
 	ctx, cancel := m.opContext(m.cfg.Timeouts.StatusCheck)
 	defer cancel()
-	newSettings, err := m.getWDSRuntimeSettings(ctx, wds, qmi.IpFamilyV4)
-	if err != nil {
-		return err
+
+	if recorded.IPv4Address != nil && wds != nil {
+		newSettings, err := m.getWDSRuntimeSettings(ctx, wds, qmi.IpFamilyV4)
+		if err != nil {
+			return err
+		}
+		if newSettings == nil || !newSettings.IPv4Address.Equal(recorded.IPv4Address) {
+			var modemIP net.IP
+			if newSettings != nil {
+				modemIP = newSettings.IPv4Address
+			}
+			return fmt.Errorf("local IPv4 %s != modem IPv4 %s", recorded.IPv4Address, modemIP)
+		}
 	}
 
-	// Compare with recorded IP / 与记录的IP进行比较
-	if newSettings == nil || !newSettings.IPv4Address.Equal(recorded.IPv4Address) {
-		var modemIP net.IP
-		if newSettings != nil {
-			modemIP = newSettings.IPv4Address
+	if recorded.IPv6Address != nil && wdsV6 != nil {
+		newSettingsV6, err := m.getWDSRuntimeSettings(ctx, wdsV6, qmi.IpFamilyV6)
+		if err != nil {
+			return err
 		}
-		return fmt.Errorf("local IP %s != modem IP %s", recorded.IPv4Address, modemIP)
+		if newSettingsV6 == nil || !newSettingsV6.IPv6Address.Equal(recorded.IPv6Address) {
+			var modemIPv6 net.IP
+			if newSettingsV6 != nil {
+				modemIPv6 = newSettingsV6.IPv6Address
+			}
+			return fmt.Errorf("local IPv6 %s != modem IPv6 %s", recorded.IPv6Address, modemIPv6)
+		}
+	}
+
+	if m.configureNetworkHook == nil {
+		if targetIface := strings.TrimSpace(m.activeNetInterface()); targetIface != "" {
+			if ifaceIPs, err := netcfg.GetCurrentIPs(targetIface); err == nil {
+				if recorded.IPv4Address != nil && !containsIP(ifaceIPs, recorded.IPv4Address) {
+					return fmt.Errorf("interface %s missing IPv4 %s (current=%v)", targetIface, recorded.IPv4Address, ifaceIPs)
+				}
+				if recorded.IPv6Address != nil && !containsIP(ifaceIPs, recorded.IPv6Address) {
+					return fmt.Errorf("interface %s missing IPv6 %s (current=%v)", targetIface, recorded.IPv6Address, ifaceIPs)
+				}
+			}
+		}
 	}
 
 	return nil
@@ -4408,8 +5051,13 @@ func (m *Manager) handleDialFailure(err error) {
 	retryCount := m.retryCount
 	m.mu.Unlock()
 
-	if retryCount == m.cfg.RetryPolicy.RadioResetAfter {
-		go m.RadioReset()
+	if m.cfg.RetryPolicy.RadioResetAfter > 0 && retryCount == m.cfg.RetryPolicy.RadioResetAfter && !m.isStoppingOrCanceled() {
+		if resetErr := m.RadioReset(); resetErr != nil {
+			m.log.WithError(resetErr).Warn("RadioReset before reconnect retry failed")
+		}
+	}
+	if m.isStoppingOrCanceled() {
+		return
 	}
 	m.emitEvent(Event{Type: EventReconnecting, State: StateDisconnected, Error: err})
 	m.log.Infof("Will retry in %v (%d/%d)", delay, retryCount, len(m.retryDelays))
@@ -4675,6 +5323,17 @@ func (m *Manager) handleIndication(evt qmi.Event) {
 
 	case qmi.EventNewMessage:
 		m.log.Info("New SMS Indication received")
+		if evt.Packet == nil {
+			m.emitEvent(Event{
+				Type:       EventNewSMS,
+				State:      m.State(),
+				SMSIndex:   0xFFFFFFFF,
+				RawQMIType: evt.Type,
+				ServiceID:  evt.ServiceID,
+				MessageID:  evt.MessageID,
+			})
+			return
+		}
 		if tlv := qmi.FindTLV(evt.Packet.TLVs, 0x10); tlv != nil && len(tlv.Value) >= 5 {
 			// 0x10 = MT Message: StorageType (1) + MemoryIndex (4) / 0x10 = MT 消息: 存储类型(1) + 内存索引(4)
 			storage := tlv.Value[0]

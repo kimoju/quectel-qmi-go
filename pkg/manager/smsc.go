@@ -210,6 +210,21 @@ func selectUSIMOrFallback(tx apduSender) error {
 	return nil
 }
 
+func encodeISO7816LogicalChannelCLA(cla, channel byte) byte {
+	if channel == 0 {
+		return cla
+	}
+	if channel <= 3 {
+		// ISO/IEC 7816-4 first interindustry CLA coding (channels 0..3): clear b7 and set b2..b1.
+		return (cla & 0xBC) | (channel & 0x03)
+	}
+	if channel <= 19 {
+		// ISO/IEC 7816-4 further interindustry CLA coding (channels 4..19): set b7=1 and b4..b1=(ch-4).
+		return (cla & 0xB0) | 0x40 | ((channel - 4) & 0x0F)
+	}
+	return cla
+}
+
 func (m *Manager) getSMSCFromUIMLogicalChannel(ctx context.Context, slot uint8) (string, error) {
 	if slot == 0 {
 		slot = smscAPDUSlot
@@ -228,7 +243,11 @@ func (m *Manager) getSMSCFromUIMLogicalChannel(ctx context.Context, slot uint8) 
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		return m.SendAPDUContext(ctx, slot, channel, command)
+		cmdWithCLA := append([]byte(nil), command...)
+		if len(cmdWithCLA) > 0 {
+			cmdWithCLA[0] = encodeISO7816LogicalChannelCLA(cmdWithCLA[0], channel)
+		}
+		return m.SendAPDUContext(ctx, slot, channel, cmdWithCLA)
 	}
 	smsc, err := getSMSCFromSelectedFiles(tx)
 	if strings.TrimSpace(smsc) != "" {
@@ -484,7 +503,12 @@ func transmitBasicAPDUWithFollowUp(tx apduSender, apdu []byte) ([]byte, error) {
 	// 6Cxx: Le mismatch, retry once with modem suggested length.
 	if sw1 == 0x6C && len(apdu) >= 5 {
 		retry := append([]byte(nil), apdu...)
-		retry[len(retry)-1] = sw2
+		if len(apdu) > 5 && len(apdu) == 5+int(apdu[4]) {
+			// Case-3 APDU (CLA INS P1 P2 Lc Data, no Le): append sw2 as Le instead of overwriting Data[Lc-1].
+			retry = append(retry, sw2)
+		} else {
+			retry[len(retry)-1] = sw2
+		}
 		rsp, err = tx(retry)
 		if err != nil {
 			return nil, err
@@ -495,9 +519,13 @@ func transmitBasicAPDUWithFollowUp(tx apduSender, apdu []byte) ([]byte, error) {
 		}
 	}
 
-	// 61xx: follow up by GET RESPONSE.
+	// 61xx: follow up by GET RESPONSE (preserve CLA logical channel bits if set).
 	if sw1 == 0x61 {
-		getRespCmd := []byte{0x00, 0xC0, 0x00, 0x00, sw2}
+		cla := byte(0x00)
+		if len(apdu) > 0 {
+			cla = apdu[0]
+		}
+		getRespCmd := []byte{cla, 0xC0, 0x00, 0x00, sw2}
 		rsp, err = tx(getRespCmd)
 		if err != nil {
 			return nil, err
@@ -553,24 +581,27 @@ func parseSMSCFromTSServiceCentreAddress(raw []byte) string {
 }
 
 func parseSMSCFromSMSPRecord(record []byte) string {
-	if len(record) == 0 {
+	if len(record) == 0 || allBytes(record, 0xFF) {
 		return ""
 	}
 
-	// Per common EFSMSP layout in 3GPP TS 31.102 examples,
-	// offset 13 is preferred before generic scan.
-	if smsc := decodeSMSCAtOffset(record, 13); smsc != "" {
-		return smsc
-	}
-	for offset := 0; offset < len(record)-2; offset++ {
-		if offset == 13 {
-			continue
+	// Per 3GPP TS 31.102 §4.2.25, an EF_SMSP record has Y >= 0 bytes of Alpha-ID
+	// followed by a fixed 28-byte tail:
+	//   base + 0       : Parameter Indicators (bit 1 == 0 means TS-SCA present)
+	//   base + 1..12   : TP-DestinationAddress (12 bytes - MUST NOT be mistaken for SMSC!)
+	//   base + 13..24  : TS-ServiceCentreAddress (12 bytes)
+	//   base + 25..27  : TP-PID, TP-DCS, TP-VP
+	if len(record) >= 28 {
+		base := len(record) - 28
+		paramInd := record[base]
+		if paramInd != 0xFF && (paramInd&0x02) != 0 {
+			return ""
 		}
-		if smsc := decodeSMSCAtOffset(record, offset); smsc != "" {
-			return smsc
-		}
+		return decodeSMSCAtOffset(record, base+13)
 	}
-	return ""
+
+	// Fallback only for non-standard truncated payloads (< 28 bytes).
+	return parseSMSCFromTSServiceCentreAddress(record)
 }
 
 func decodeSMSCAtOffset(buf []byte, offset int) string {

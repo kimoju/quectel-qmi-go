@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -18,11 +19,21 @@ var (
 	dialProxyHook         = dialProxy
 	startProxyProcessHook = startProxyProcess
 	proxyRetryDelay       = 100 * time.Millisecond
+	proxySpawnMu          sync.Mutex
 )
 
 func openProxyTransport(ctx context.Context, opts ClientOptions) (qmiTransport, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		timeout := opts.ProxyOpenTimeout
+		if timeout <= 0 {
+			timeout = defaultProxyOpenTimeout
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
 	}
 	proxyPath := opts.ProxyPath
 	if proxyPath == "" {
@@ -44,8 +55,17 @@ func openProxyTransport(ctx context.Context, opts ClientOptions) (qmiTransport, 
 	if _, err := os.Stat(proxyExecutable); err != nil {
 		return nil, fmt.Errorf("connect qmi-proxy %q failed: %w; proxy executable %s is unavailable: %v", proxyPath, firstErr, proxyExecutable, err)
 	}
-	if err := startProxyProcessHook(proxyExecutable); err != nil {
-		return nil, fmt.Errorf("connect qmi-proxy %q failed and start %s failed: %w", proxyPath, proxyExecutable, err)
+
+	proxySpawnMu.Lock()
+	conn, retryErr := dialProxyHook(ctx, proxyPath)
+	if retryErr == nil {
+		proxySpawnMu.Unlock()
+		return conn, nil
+	}
+	startErr := startProxyProcessHook(proxyExecutable)
+	proxySpawnMu.Unlock()
+	if startErr != nil {
+		return nil, fmt.Errorf("connect qmi-proxy %q failed and start %s failed: %w", proxyPath, proxyExecutable, startErr)
 	}
 
 	var lastErr error = firstErr
@@ -88,6 +108,9 @@ func proxySocketAddress(proxyPath string) string {
 	if strings.HasPrefix(proxyPath, "@") {
 		return "\x00" + strings.TrimPrefix(proxyPath, "@")
 	}
+	if strings.Contains(proxyPath, "/") {
+		return proxyPath
+	}
 	return "\x00" + proxyPath
 }
 
@@ -99,5 +122,8 @@ func startProxyProcess(proxyExecutable string) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	return cmd.Process.Release()
+	go func() {
+		_ = cmd.Wait()
+	}()
+	return nil
 }

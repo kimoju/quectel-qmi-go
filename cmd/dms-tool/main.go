@@ -13,19 +13,26 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Printf("%v", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	devicePath := flag.String("device", defaultQmiDevice(), "Path to QMI device")
 	action := flag.String("action", "all", "Action: all, sim, pin, uim, mode, serial, revision, dump")
 	flag.Parse()
 
 	client, err := qmi.NewClientWithOptions(context.Background(), *devicePath, qmi.ClientOptions{})
 	if err != nil {
-		log.Fatalf("Failed to create QMI client: %v", err)
+		return fmt.Errorf("failed to create QMI client: %w", err)
 	}
 	defer client.Close()
 
 	dms, err := qmi.NewDMSService(client)
 	if err != nil {
-		log.Fatalf("Failed to create DMS service: %v", err)
+		return fmt.Errorf("failed to create DMS service: %w", err)
 	}
 	defer dms.Close()
 
@@ -55,8 +62,9 @@ func main() {
 	case "dump":
 		runDump(ctx, client, dms)
 	default:
-		log.Fatalf("Unknown action: %s", *action)
+		return fmt.Errorf("unknown action: %s", *action)
 	}
+	return nil
 }
 
 func runSIM(ctx context.Context, dms *qmi.DMSService) {

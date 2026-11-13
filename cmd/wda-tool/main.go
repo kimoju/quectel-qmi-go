@@ -12,6 +12,13 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Printf("%v", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	devicePath := flag.String("device", defaultQmiDevice(), "Path to QMI device")
 	action := flag.String("action", "all", "Action: all, get-format, set-rawip, set-eth, get-qmap, set-qmap, loopback-on, loopback-off, dump")
 	qmapInBand := flag.Int("qmap-inband", 0, "QMAP InBandFlowControl for set-qmap (0/1)")
@@ -20,7 +27,7 @@ func main() {
 
 	client, err := qmi.NewClientWithOptions(context.Background(), *devicePath, qmi.ClientOptions{})
 	if err != nil {
-		log.Fatalf("Failed to create QMI client: %v", err)
+		return fmt.Errorf("failed to create QMI client: %w", err)
 	}
 	defer client.Close()
 
@@ -29,7 +36,7 @@ func main() {
 
 	wda, err := qmi.NewWDAService(client)
 	if err != nil {
-		log.Fatalf("Failed to create WDA service: %v", err)
+		return fmt.Errorf("failed to create WDA service: %w", err)
 	}
 	defer wda.Close()
 
@@ -41,38 +48,37 @@ func main() {
 		getFormat(ctx, wda)
 	case "set-rawip":
 		if err := wda.SetDataFormat(ctx, qmi.DataFormat{LinkProtocol: qmi.LinkProtocolIP, UlDataAggregation: 0, DlDataAggregation: 0}); err != nil {
-			log.Fatalf("SetDataFormat rawip failed: %v", err)
+			return fmt.Errorf("SetDataFormat rawip failed: %w", err)
 		}
 		getFormat(ctx, wda)
 	case "set-eth":
 		if err := wda.SetDataFormat(ctx, qmi.DataFormat{LinkProtocol: qmi.LinkProtocolEthernet, UlDataAggregation: 0, DlDataAggregation: 0}); err != nil {
-			log.Fatalf("SetDataFormat ethernet failed: %v", err)
+			return fmt.Errorf("SetDataFormat ethernet failed: %w", err)
 		}
 		getFormat(ctx, wda)
 	case "get-qmap":
 		getQmap(ctx, wda)
 	case "set-qmap":
 		if err := wda.SetQMAPSettings(ctx, qmi.QMAPSettings{InBandFlowControl: uint8(*qmapInBand)}); err != nil {
-			log.Fatalf("SetQMAPSettings failed: %v", err)
+			return fmt.Errorf("SetQMAPSettings failed: %w", err)
 		}
 		getQmap(ctx, wda)
 	case "loopback-on":
 		if err := wda.SetLoopbackConfig(ctx, qmi.LoopbackConfig{State: 1, ReplicationFactor: uint32(*replicate)}); err != nil {
-			log.Printf("SetLoopbackConfig on failed: %v", err)
-			return
+			return fmt.Errorf("SetLoopbackConfig on failed: %w", err)
 		}
 		fmt.Println("Loopback enabled")
 	case "loopback-off":
 		if err := wda.SetLoopbackConfig(ctx, qmi.LoopbackConfig{State: 0, ReplicationFactor: 0}); err != nil {
-			log.Printf("SetLoopbackConfig off failed: %v", err)
-			return
+			return fmt.Errorf("SetLoopbackConfig off failed: %w", err)
 		}
 		fmt.Println("Loopback disabled")
 	case "dump":
 		dump(ctx, client, wda)
 	default:
-		log.Fatalf("Unknown action: %s", *action)
+		return fmt.Errorf("unknown action: %s", *action)
 	}
+	return nil
 }
 
 func getFormat(ctx context.Context, wda *qmi.WDAService) {
@@ -88,8 +94,12 @@ func getFormat(ctx context.Context, wda *qmi.WDAService) {
 	fmt.Printf("DlDataAggregation: %d\n", f.DlDataAggregation)
 	fmt.Printf("DlMaxDatagrams: %d\n", f.DlMaxDatagrams)
 	fmt.Printf("DlMaxSize: %d\n", f.DlMaxSize)
-	fmt.Printf("EndpointType: %d\n", f.EndpointType)
-	fmt.Printf("EndpointID: %d\n", f.EndpointID)
+	fmt.Printf("UlMaxDatagrams: %d\n", f.UlMaxDatagrams)
+	fmt.Printf("UlMaxSize: %d\n", f.UlMaxSize)
+	if f.HasEndpoint {
+		fmt.Printf("EndpointType: %d\n", f.EndpointType)
+		fmt.Printf("EndpointID: %d\n", f.EndpointID)
+	}
 	fmt.Println()
 }
 

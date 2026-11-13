@@ -9,7 +9,7 @@ require (
 )
 
 require (
-	github.com/kimoju/netlink v0.0.0-20260810142421-916feecbc75b
+	github.com/kimoju/netlink v0.0.0-20261113200857-18228c163f52
 	github.com/vishvananda/netns v0.0.5 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
 	golang.org/x/sys v0.19.0 // indirect

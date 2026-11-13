@@ -12,6 +12,13 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Printf("%v", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	devicePath := flag.String("device", defaultQmiDevice(), "Path to QMI device")
 	action := flag.String("action", "all", "Action: all, device, sim")
 	flag.Parse()
@@ -19,20 +26,25 @@ func main() {
 	// Initialize client
 	client, err := qmi.NewClientWithOptions(context.Background(), *devicePath, qmi.ClientOptions{})
 	if err != nil {
-		log.Fatalf("Failed to create QMI client: %v", err)
+		return fmt.Errorf("failed to create QMI client: %w", err)
 	}
 	defer client.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if *action == "all" || *action == "device" {
+	switch *action {
+	case "all":
 		testDeviceInfo(ctx, client)
-	}
-
-	if *action == "all" || *action == "sim" {
 		testSIMInfo(ctx, client)
+	case "device":
+		testDeviceInfo(ctx, client)
+	case "sim":
+		testSIMInfo(ctx, client)
+	default:
+		return fmt.Errorf("unknown action: %s", *action)
 	}
+	return nil
 }
 
 func defaultQmiDevice() string {

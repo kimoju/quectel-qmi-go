@@ -626,22 +626,23 @@ func (u *UIMService) getCardStatusAID(ctx context.Context, appType uint8, prefix
 	return nil, fmt.Errorf("UIM %s application not found: app_type=0x%02x", label, appType)
 }
 
-// VerifyPIN verifies the PIN code / VerifyPIN 验证 PIN 码
+// VerifyPIN verifies the PIN code using the default primary GW provisioning session / VerifyPIN 验证 PIN 码
 func (u *UIMService) VerifyPIN(ctx context.Context, pinID uint8, pin string) error {
-	var tlvs []TLV
+	return u.VerifyPINWithSession(ctx, UIMSessionTypePrimaryGWProvisioning, nil, pinID, pin)
+}
 
-	// TLV 0x01: PIN Info / PIN 信息
-	// PIN ID (1) + PIN Len (1) + PIN Value
+// VerifyPINWithSession verifies the PIN code for an explicit UIM session.
+func (u *UIMService) VerifyPINWithSession(ctx context.Context, sessionType uint8, aid []byte, pinID uint8, pin string) error {
 	pinBytes := []byte(pin)
 	buf := make([]byte, 2+len(pinBytes))
 	buf[0] = pinID
 	buf[1] = uint8(len(pinBytes))
 	copy(buf[2:], pinBytes)
-	tlvs = append(tlvs, TLV{Type: 0x01, Value: buf})
 
-	// TLV 0x02: Session Info / 会话信息 (Optional, default usually works)
-	// AidLen (1) + Aid...
-	// For simplicity, we omit session info assuming default primary session
+	tlvs := []TLV{
+		buildUIMSessionTLV(sessionType, aid),
+		{Type: 0x02, Value: buf},
+	}
 
 	resp, err := u.client.SendRequest(ctx, ServiceUIM, u.clientID, UIMVerifyPIN, tlvs)
 	if err != nil {
@@ -650,11 +651,13 @@ func (u *UIMService) VerifyPIN(ctx context.Context, pinID uint8, pin string) err
 	return resp.CheckResult()
 }
 
-// SetPINProtection enables or disables PIN protection / SetPINProtection 启用或禁用 PIN 保护
+// SetPINProtection enables or disables PIN protection using the default primary GW provisioning session / SetPINProtection 启用或禁用 PIN 保护
 func (u *UIMService) SetPINProtection(ctx context.Context, pinID uint8, enabled bool, pin string) error {
-	var tlvs []TLV
+	return u.SetPINProtectionWithSession(ctx, UIMSessionTypePrimaryGWProvisioning, nil, pinID, enabled, pin)
+}
 
-	// TLV 0x01: PIN Info / PIN 信息
+// SetPINProtectionWithSession enables or disables PIN protection for an explicit UIM session.
+func (u *UIMService) SetPINProtectionWithSession(ctx context.Context, sessionType uint8, aid []byte, pinID uint8, enabled bool, pin string) error {
 	pinBytes := []byte(pin)
 	buf := make([]byte, 2+1+len(pinBytes)) // ID + Enable + Len + PIN
 	buf[0] = pinID
@@ -665,7 +668,11 @@ func (u *UIMService) SetPINProtection(ctx context.Context, pinID uint8, enabled 
 	}
 	buf[2] = uint8(len(pinBytes))
 	copy(buf[3:], pinBytes)
-	tlvs = append(tlvs, TLV{Type: 0x01, Value: buf})
+
+	tlvs := []TLV{
+		buildUIMSessionTLV(sessionType, aid),
+		{Type: 0x02, Value: buf},
+	}
 
 	resp, err := u.client.SendRequest(ctx, ServiceUIM, u.clientID, UIMSetPINProtection, tlvs)
 	if err != nil {
@@ -674,11 +681,13 @@ func (u *UIMService) SetPINProtection(ctx context.Context, pinID uint8, enabled 
 	return resp.CheckResult()
 }
 
-// ChangePIN changes the PIN code / ChangePIN 修改 PIN 码
+// ChangePIN changes the PIN code using the default primary GW provisioning session / ChangePIN 修改 PIN 码
 func (u *UIMService) ChangePIN(ctx context.Context, pinID uint8, oldPIN, newPIN string) error {
-	var tlvs []TLV
+	return u.ChangePINWithSession(ctx, UIMSessionTypePrimaryGWProvisioning, nil, pinID, oldPIN, newPIN)
+}
 
-	// TLV 0x01: PIN Info / PIN 信息
+// ChangePINWithSession changes the PIN code for an explicit UIM session.
+func (u *UIMService) ChangePINWithSession(ctx context.Context, sessionType uint8, aid []byte, pinID uint8, oldPIN, newPIN string) error {
 	oldBytes := []byte(oldPIN)
 	newBytes := []byte(newPIN)
 	buf := make([]byte, 1+1+len(oldBytes)+1+len(newBytes))
@@ -689,7 +698,10 @@ func (u *UIMService) ChangePIN(ctx context.Context, pinID uint8, oldPIN, newPIN 
 	buf[2+len(oldBytes)] = uint8(len(newBytes))
 	copy(buf[3+len(oldBytes):], newBytes)
 
-	tlvs = append(tlvs, TLV{Type: 0x01, Value: buf})
+	tlvs := []TLV{
+		buildUIMSessionTLV(sessionType, aid),
+		{Type: 0x02, Value: buf},
+	}
 
 	resp, err := u.client.SendRequest(ctx, ServiceUIM, u.clientID, UIMChangePIN, tlvs)
 	if err != nil {
@@ -698,11 +710,13 @@ func (u *UIMService) ChangePIN(ctx context.Context, pinID uint8, oldPIN, newPIN 
 	return resp.CheckResult()
 }
 
-// UnblockPIN unblocks the PIN using PUK / UnblockPIN 使用 PUK 解锁 PIN
+// UnblockPIN unblocks the PIN using PUK on the default primary GW provisioning session / UnblockPIN 使用 PUK 解锁 PIN
 func (u *UIMService) UnblockPIN(ctx context.Context, pinID uint8, puk, newPIN string) error {
-	var tlvs []TLV
+	return u.UnblockPINWithSession(ctx, UIMSessionTypePrimaryGWProvisioning, nil, pinID, puk, newPIN)
+}
 
-	// TLV 0x01: Unblock Info / 解锁信息
+// UnblockPINWithSession unblocks the PIN using PUK for an explicit UIM session.
+func (u *UIMService) UnblockPINWithSession(ctx context.Context, sessionType uint8, aid []byte, pinID uint8, puk, newPIN string) error {
 	pukBytes := []byte(puk)
 	newBytes := []byte(newPIN)
 	buf := make([]byte, 1+1+len(pukBytes)+1+len(newBytes))
@@ -713,7 +727,10 @@ func (u *UIMService) UnblockPIN(ctx context.Context, pinID uint8, puk, newPIN st
 	buf[2+len(pukBytes)] = uint8(len(newBytes))
 	copy(buf[3+len(pukBytes):], newBytes)
 
-	tlvs = append(tlvs, TLV{Type: 0x01, Value: buf})
+	tlvs := []TLV{
+		buildUIMSessionTLV(sessionType, aid),
+		{Type: 0x02, Value: buf},
+	}
 
 	resp, err := u.client.SendRequest(ctx, ServiceUIM, u.clientID, UIMUnblockPIN, tlvs)
 	if err != nil {
@@ -1658,7 +1675,7 @@ func (u *UIMService) readPNNRecords(ctx context.Context, fileID uint16) ([]PNNRe
 			}
 			return records, err
 		}
-		if len(trimSPNPadding(data)) == 0 {
+		if len(trimSIMFFPadding(data)) == 0 {
 			break
 		}
 		if rec, ok := decodePNNRecord(int(i), data); ok {
@@ -1693,7 +1710,7 @@ func (u *UIMService) readOPLRecords(ctx context.Context, fileID uint16) ([]OPLRe
 			}
 			return records, err
 		}
-		if len(trimSPNPadding(data)) == 0 {
+		if len(trimSIMFFPadding(data)) == 0 {
 			break
 		}
 		if rec, ok := decodeOPLRecord(int(i), data); ok {
@@ -1754,11 +1771,8 @@ func decodeEFSPN(data []byte) (string, error) {
 	if len(data) == 0 {
 		return "", fmt.Errorf("EF_SPN data empty")
 	}
-	name := data
-	if len(name) > 1 {
-		name = name[1:]
-	}
-	name = trimSPNPadding(name)
+	// Byte 0 is display condition per 3GPP TS 31.102 §4.2.12.
+	name := data[1:]
 	if len(name) == 0 {
 		return "", fmt.Errorf("EF_SPN name empty")
 	}
@@ -1775,6 +1789,10 @@ func decodeEFSPN(data []byte) (string, error) {
 	case 0x82:
 		decoded, err = decodeSPNCompressedUCS2(name, 2)
 	default:
+		name = trimSIMFFPadding(name)
+		if len(name) == 0 || name[0] == 0xFF {
+			return "", fmt.Errorf("EF_SPN name empty")
+		}
 		if isPrintableASCII(name) {
 			decoded = string(name)
 		} else {
@@ -1791,16 +1809,32 @@ func decodeEFSPN(data []byte) (string, error) {
 	return decoded, nil
 }
 
-func trimSPNPadding(data []byte) []byte {
+func trimSIMFFPadding(data []byte) []byte {
 	end := len(data)
-	for end > 0 && (data[end-1] == 0xFF || data[end-1] == 0x00) {
+	for end > 0 && data[end-1] == 0xFF {
 		end--
 	}
 	return data[:end]
 }
 
+func trimUCS2Padding(data []byte) []byte {
+	if len(data)%2 == 1 && data[len(data)-1] == 0xFF {
+		data = data[:len(data)-1]
+	}
+	end := len(data)
+	for end >= 2 {
+		hi, lo := data[end-2], data[end-1]
+		if (hi == 0xFF && lo == 0xFF) || (hi == 0x00 && lo == 0x00) {
+			end -= 2
+			continue
+		}
+		break
+	}
+	return data[:end]
+}
+
 func simRawHex(data []byte) string {
-	data = trimSPNPadding(data)
+	data = trimSIMFFPadding(data)
 	if len(data) == 0 {
 		return ""
 	}
@@ -1809,7 +1843,7 @@ func simRawHex(data []byte) string {
 
 func decodePNNRecord(record int, data []byte) (PNNRecord, bool) {
 	raw := simRawHex(data)
-	data = trimSPNPadding(data)
+	data = trimSIMFFPadding(data)
 	if len(data) == 0 {
 		return PNNRecord{}, false
 	}
@@ -1839,7 +1873,7 @@ func decodePNNRecord(record int, data []byte) (PNNRecord, bool) {
 
 func decodeOPLRecord(record int, data []byte) (OPLRecord, bool) {
 	raw := simRawHex(data)
-	data = trimSPNPadding(data)
+	data = trimSIMFFPadding(data)
 	if len(data) < 8 {
 		return OPLRecord{}, false
 	}
@@ -1879,7 +1913,7 @@ func isExactDecimalPLMN(plmn string) bool {
 
 func decodeSIMServiceTable(kind string, data []byte) *SIMServiceTable {
 	raw := simRawHex(data)
-	data = trimSPNPadding(data)
+	data = trimSIMFFPadding(data)
 	if len(data) == 0 {
 		return nil
 	}
@@ -1895,8 +1929,7 @@ func decodeSIMServiceTable(kind string, data []byte) *SIMServiceTable {
 }
 
 func decodeSIMAlphaIdentifier(data []byte) (string, error) {
-	data = trimSPNPadding(data)
-	if len(data) == 0 {
+	if len(data) == 0 || data[0] == 0xFF {
 		return "", fmt.Errorf("SIM alpha identifier empty")
 	}
 	switch data[0] {
@@ -1907,6 +1940,10 @@ func decodeSIMAlphaIdentifier(data []byte) (string, error) {
 	case 0x82:
 		return decodeSPNCompressedUCS2(data, 2)
 	default:
+		data = trimSIMFFPadding(data)
+		if len(data) == 0 || data[0] == 0xFF {
+			return "", fmt.Errorf("SIM alpha identifier empty")
+		}
 		if isPrintableASCII(data) {
 			return strings.TrimSpace(string(data)), nil
 		}
@@ -1915,7 +1952,6 @@ func decodeSIMAlphaIdentifier(data []byte) (string, error) {
 }
 
 func decodePNNNetworkName(data []byte) (string, error) {
-	data = trimSPNPadding(data)
 	if len(data) == 0 {
 		return "", fmt.Errorf("PNN network name empty")
 	}
@@ -1925,7 +1961,7 @@ func decodePNNNetworkName(data []byte) (string, error) {
 		payload := data[1:]
 		switch coding {
 		case 0:
-			return decodePackedGSM7(payload, int(info&0x07))
+			return decodePackedGSM7(trimSIMFFPadding(payload), int(info&0x07))
 		case 1:
 			return decodeSPNUCS2(payload)
 		}
@@ -1984,7 +2020,7 @@ func decodeOPLPLMN(data []byte) string {
 }
 
 func decodeSPNUCS2(data []byte) (string, error) {
-	data = trimSPNPadding(data)
+	data = trimUCS2Padding(data)
 	if len(data) == 0 {
 		return "", fmt.Errorf("UCS2 SPN empty")
 	}

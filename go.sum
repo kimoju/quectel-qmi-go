@@ -1,8 +1,8 @@
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/kimoju/netlink v0.0.0-20260810142421-916feecbc75b h1:CosPkXHH9YSVbg8F1U7XkyWWWq/6GA+SAC2ufLmS0ys=
-github.com/kimoju/netlink v0.0.0-20260810142421-916feecbc75b/go.mod h1:lQkbh+Lol367kof4bvIynstrakc170ZTeUm59LweLC8=
+github.com/kimoju/netlink v0.0.0-20261113200857-18228c163f52 h1:dTTE65gowJhKniXENpHGWYR7wd1Q5/gTKAzR9T44NgI=
+github.com/kimoju/netlink v0.0.0-20261113200857-18228c163f52/go.mod h1:lQkbh+Lol367kof4bvIynstrakc170ZTeUm59LweLC8=
 github.com/kr/pty v1.1.1/go.mod h1:pFQYn66WHrOpPYNljwOMqo10TkYh1fy3cYio2l3bCsQ=
 github.com/kr/text v0.1.0/go.mod h1:4Jbv+DJW3UT/LiOwJeYQe1efqtUx/iVham/4vfdArNI=
 github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e/go.mod h1:zD1mROLANZcx1PVRCS0qkT7pwLkGfwJo4zjcN/Tysno=

@@ -19,9 +19,9 @@ func (m *Manager) PreWarmIdentities(forceAll bool) {
 		return
 	}
 	generation := m.snapshot.IdentityGeneration()
-	go func(gen uint64) {
+	m.spawnTrackedBackground(func(parentCtx context.Context) {
 		// 给予足够的超时时间，避免后台抓取时与其他初始化流程抢占导致超时
-		ctx, cancel := contextWithMaxTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := contextWithMaxTimeout(parentCtx, 10*time.Second)
 		defer cancel()
 
 		var wg sync.WaitGroup
@@ -35,6 +35,9 @@ func (m *Manager) PreWarmIdentities(forceAll bool) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				if ctx.Err() != nil {
+					return
+				}
 				// DMS 获取硬件信息
 				if devInfo, err := m.GetDeviceSerialNumbers(ctx); err == nil && devInfo != nil {
 					lock.Lock()
@@ -68,6 +71,9 @@ func (m *Manager) PreWarmIdentities(forceAll bool) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			if ctx.Err() != nil {
+				return
+			}
 			// 获取卡关联信息
 			if iccid, err := m.GetICCID(ctx); err == nil {
 				lock.Lock()
@@ -88,12 +94,19 @@ func (m *Manager) PreWarmIdentities(forceAll bool) {
 		}()
 
 		wg.Wait()
-		if !m.snapshot.UpdateIdentitiesIfGeneration(ids, gen) {
-			m.log.WithField("generation", gen).Debug("Skip stale device identities pre-warm write")
+		if ctx.Err() != nil {
+			return
+		}
+		if !m.snapshot.UpdateIdentitiesIfGeneration(ids, genFallback(generation)) {
+			m.log.WithField("generation", generation).Debug("Skip stale device identities pre-warm write")
 			return
 		}
 		m.log.WithField("imei", ids.IMEI).WithField("iccid", ids.ICCID).Debug("Device identities pre-warmed")
-	}(generation)
+	})
+}
+
+func genFallback(gen uint64) uint64 {
+	return gen
 }
 
 // GetCachedIdentities 提供给上层应用零 IPC 读取当前设备的基础与卡标识。
@@ -114,10 +127,16 @@ func (m *Manager) GetCachedIdentitiesReadiness() (bool, bool) {
 // CTLGetServiceVersions 获取底层通信 Client 缓存的 QMI 服务版本信息。
 // 仅在 client 成功初始化后调用有效，否则返回 nil。
 func (m *Manager) CTLGetServiceVersions() map[uint8]qmi.ServiceVersion {
-	if m == nil || m.client == nil {
+	if m == nil {
 		return nil
 	}
-	return m.client.GetCachedServiceVersions()
+	m.mu.RLock()
+	client := m.client
+	m.mu.RUnlock()
+	if client == nil {
+		return nil
+	}
+	return client.GetCachedServiceVersions()
 }
 
 // GetDeviceSerialNumbers 获取设备序列号信息（含 IMEI）

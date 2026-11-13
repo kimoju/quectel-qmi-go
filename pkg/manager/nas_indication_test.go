@@ -219,12 +219,13 @@ func TestHandleIndicationNASSignalInfoChanged(t *testing.T) {
 		Type: qmi.EventNASSignalInfoChanged,
 		Packet: &qmi.Packet{TLVs: []qmi.TLV{
 			{Type: 0x14, Value: []byte{0x00, uint8(rsrq), 0x38, 0xFF, 0x32, 0x00}},
-			{Type: 0x17, Value: []byte{0xE7, 0xFF, 0x9C, 0xFF, 0x1E, 0x00}},
+			{Type: 0x17, Value: []byte{0x9C, 0xFF, 0x1E, 0x00}}, // NR5G RSRP=-100, SNR=30
+			{Type: 0x18, Value: []byte{0xE7, 0xFF}},             // NR5G RSRQ=-25
 		}},
 	})
 
 	info, ts, valid := m.snapshot.NASSignalInfo()
-	if !valid || info == nil || info.LTERSRQ != -9 || info.LTERSRP != -200 || info.NR5GSINR != 30 || ts.IsZero() {
+	if !valid || info == nil || info.LTERSRQ != -9 || info.LTERSRP != -200 || info.NR5GRSRP != -100 || info.NR5GRSRQ != -25 || info.NR5GSINR != 30 || ts.IsZero() {
 		t.Fatalf("unexpected nas signal snapshot: valid=%v ts=%v info=%+v", valid, ts, info)
 	}
 }
@@ -238,13 +239,16 @@ func TestHandleIndicationNASNetworkReject(t *testing.T) {
 	m.handleIndication(qmi.Event{
 		Type: qmi.EventNASNetworkReject,
 		Packet: &qmi.Packet{TLVs: []qmi.TLV{
-			{Type: 0x10, Value: []byte{0x08, 0x15, 0x00, 0x00, 0x00}},
-			{Type: 0x11, Value: []byte("46000")},
+			{Type: 0x01, Value: []byte{0x08}},
+			{Type: 0x02, Value: []byte{0x02}},
+			{Type: 0x03, Value: []byte{0x15}},
+			{Type: 0x10, Value: []byte{0xCC, 0x01, 0x00, 0x00, 0x00}},
+			{Type: 0x11, Value: []byte{0x2A, 0x00, 0x00, 0x00}},
 		}},
 	})
 
 	info, ts, valid := m.snapshot.NASNetworkReject()
-	if !valid || info == nil || info.RadioInterface != 0x08 || info.RejectCause != 0x15 || info.PLMN != "46000" || ts.IsZero() {
+	if !valid || info == nil || info.RadioInterface != 0x08 || info.ServiceDomain != 0x02 || info.RejectCause != 0x15 || info.PLMN != "46000" || !info.HasCSGID || info.CSGID != 42 || ts.IsZero() {
 		t.Fatalf("unexpected nas reject snapshot: valid=%v ts=%v info=%+v", valid, ts, info)
 	}
 }

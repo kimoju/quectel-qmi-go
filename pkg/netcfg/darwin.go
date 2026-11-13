@@ -40,7 +40,9 @@ func (d *DarwinConfigurator) FlushAddresses(ifname string) error {
 }
 
 func (d *DarwinConfigurator) AddDefaultRoute(ifname string, gateway net.IP) error {
-	// route add default gateway -interface ifname
+	if len(gateway) == 0 || gateway.IsUnspecified() {
+		return d.AddDefaultRouteDirect(ifname, false)
+	}
 	if gateway.To4() != nil {
 		return d.run("route", "add", "default", gateway.String(), "-interface", ifname)
 	}
@@ -71,7 +73,7 @@ func (d *DarwinConfigurator) SetMTU(ifname string, mtu int) error {
 	return d.run("ifconfig", ifname, "mtu", strconv.Itoa(mtu))
 }
 
-func (d *DarwinConfigurator) GetCurrentIP(ifname string) (net.IP, error) {
+func (d *DarwinConfigurator) GetCurrentIPs(ifname string) ([]net.IP, error) {
 	iface, err := net.InterfaceByName(ifname)
 	if err != nil {
 		return nil, err
@@ -80,14 +82,31 @@ func (d *DarwinConfigurator) GetCurrentIP(ifname string) (net.IP, error) {
 	if err != nil {
 		return nil, err
 	}
+	var v4s, v6s []net.IP
 	for _, addr := range addrs {
-		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ipnet.IP.To4() != nil {
-				return ipnet.IP, nil
+		ipnet, ok := addr.(*net.IPNet)
+		if !ok || len(ipnet.IP) == 0 || ipnet.IP.IsLoopback() || ipnet.IP.IsUnspecified() || ipnet.IP.IsMulticast() {
+			continue
+		}
+		if v4 := ipnet.IP.To4(); v4 != nil {
+			if !v4.IsLinkLocalUnicast() {
+				v4s = append(v4s, v4)
 			}
+			continue
+		}
+		if v6 := ipnet.IP.To16(); v6 != nil && !v6.IsLinkLocalUnicast() && !v6.IsLinkLocalMulticast() {
+			v6s = append(v6s, v6)
 		}
 	}
-	return nil, nil
+	return append(v4s, v6s...), nil
+}
+
+func (d *DarwinConfigurator) GetCurrentIP(ifname string) (net.IP, error) {
+	ips, err := d.GetCurrentIPs(ifname)
+	if err != nil || len(ips) == 0 {
+		return nil, err
+	}
+	return ips[0], nil
 }
 
 func (d *DarwinConfigurator) IsUp(ifname string) (bool, error) {

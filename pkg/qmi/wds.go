@@ -282,11 +282,22 @@ func NewWDSServiceWithContext(ctx context.Context, client *Client) (*WDSService,
 
 // Close releases the WDS client ID / Close释放WDS客户端ID
 func (w *WDSService) Close() error {
+	if w == nil || w.client == nil {
+		return nil
+	}
 	return w.client.ReleaseClientID(ServiceWDS, w.clientID)
 }
 
 func (w *WDSService) ClientID() uint8 {
+	if w == nil {
+		return 0
+	}
 	return w.clientID
+}
+
+// HasClient reports whether this WDSService is backed by a live QMI Client.
+func (w *WDSService) HasClient() bool {
+	return w != nil && w.client != nil
 }
 
 // SetIPFamilyPreference sets the IP family preference (IPv4 or IPv6) / SetIPFamilyPreference设置IP族偏好 (IPv4或IPv6)

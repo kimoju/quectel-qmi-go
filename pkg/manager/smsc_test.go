@@ -102,7 +102,8 @@ func TestGetSMSCFromUIMEFSMSPSuccess(t *testing.T) {
 	for i := range record {
 		record[i] = 0xFF
 	}
-	copy(record[13:], encodeAddress("+447870002308"))
+	record[14] = 0xFD // Parameter Indicators: TS-SCA present (bit 1 = 0)
+	copy(record[27:], encodeAddress("+447870002308"))
 	fcp := []byte{
 		0x62, 0x1E,
 		0x82, 0x05, 0x42, 0x21, 0x00, 0x2A, 0x01,
@@ -186,7 +187,8 @@ func TestGetSMSCFromUIMFilesFromEFSMSP(t *testing.T) {
 	for i := range record {
 		record[i] = 0xFF
 	}
-	copy(record[13:], encodeAddress("+447870002308"))
+	record[14] = 0xFD // Parameter Indicators: TS-SCA present (bit 1 = 0)
+	copy(record[27:], encodeAddress("+447870002308"))
 
 	reader := &fakeUIMFileReader{
 		getFileAttributesWithSessionFn: func(ctx context.Context, sessionType uint8, fileID uint16, path []uint8) (*qmi.UIMFileAttributes, error) {
@@ -262,7 +264,8 @@ func TestManagerGetSMSCUsesManagerAPDUTransport(t *testing.T) {
 	for i := range record {
 		record[i] = 0xFF
 	}
-	copy(record[13:], encodeAddress("+447870002308"))
+	record[14] = 0xFD // Parameter Indicators: TS-SCA present (bit 1 = 0)
+	copy(record[27:], encodeAddress("+447870002308"))
 	fcp := []byte{
 		0x62, 0x1E,
 		0x82, 0x05, 0x42, 0x21, 0x00, 0x2A, 0x01,
@@ -351,7 +354,8 @@ func TestManagerGetSMSCUsesActiveSlot2FromUIMCardStatus(t *testing.T) {
 	for i := range record {
 		record[i] = 0xFF
 	}
-	copy(record[13:], encodeAddress("+8613800100500"))
+	record[14] = 0xFD // Parameter Indicators: TS-SCA present (bit 1 = 0)
+	copy(record[27:], encodeAddress("+8613800100500"))
 	fcp := []byte{
 		0x62, 0x07,
 		0x82, 0x05, 0x42, 0x21, 0x00, 0x2A, 0x01,

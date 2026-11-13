@@ -24,8 +24,10 @@ const (
 	ServicePBM     uint8 = 0x0C // PBM - Phonebook Manager
 	ServiceIMS     uint8 = 0x12 // IMS - IP Multimedia Subsystem Settings
 	ServiceWDA     uint8 = 0x1A // WDA - Wireless Data Admin
+	ServiceCSVT    uint8 = 0x1B // CSVT - Circuit Switched Videotelephony
+	// Deprecated: QMI service 0x1B is CSVT; IPv6 WDS uses ServiceWDS (0x01) with a separate client ID.
+	ServiceWDSIPv6 uint8 = 0x1B
 	ServiceIMSP    uint8 = 0x1F // IMSP - IMS Presence Service
-	ServiceWDSIPv6 uint8 = 0x1B // WDS for IPv6 (internal use)
 	ServiceIMSA    uint8 = 0x21 // IMSA - IMS Application Service
 	ServiceCOEX    uint8 = 0x22 // COEX - Coexistence
 )

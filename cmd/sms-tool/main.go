@@ -12,6 +12,13 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Printf("%v", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	devicePath := flag.String("device", defaultQmiDevice(), "Path to QMI device")
 	action := flag.String("action", "list", "Action to perform: list, read, read-meta, delete, delete-tag, modify-tag, mark-read, smsc")
 	index := flag.Int("index", -1, "Message index for read/delete/modify-tag")
@@ -23,14 +30,14 @@ func main() {
 	// Initialize client
 	client, err := qmi.NewClientWithOptions(context.Background(), *devicePath, qmi.ClientOptions{})
 	if err != nil {
-		log.Fatalf("Failed to create QMI client: %v", err)
+		return fmt.Errorf("failed to create QMI client: %w", err)
 	}
 	defer client.Close()
 
 	// Initialize WMS service
 	wms, err := qmi.NewWMSService(client)
 	if err != nil {
-		log.Fatalf("Failed to create WMS service: %v", err)
+		return fmt.Errorf("failed to create WMS service: %w", err)
 	}
 	defer wms.Close()
 
@@ -63,7 +70,7 @@ func main() {
 
 		msgs, err := wms.ListMessagesAuto(ctx, uint8(*storage))
 		if err != nil {
-			log.Fatalf("Failed to list messages: %v", err)
+			return fmt.Errorf("failed to list messages: %w", err)
 		}
 		for _, msg := range msgs {
 			fmt.Printf("Index: %d, Tag: %v\n", msg.Index, msg.Tag)
@@ -71,24 +78,24 @@ func main() {
 
 	case "read":
 		if *index < 0 {
-			log.Fatal("Please provide -index for read action")
+			return fmt.Errorf("please provide -index for read action")
 		}
 		fmt.Printf("Reading message at index %d...\n", *index)
 		data, err := wms.RawReadMessage(ctx, uint8(*storage), uint32(*index))
 		if err != nil {
-			log.Fatalf("Failed to read message: %v", err)
+			return fmt.Errorf("failed to read message: %w", err)
 		}
 		fmt.Printf("Raw PDU: %x\n", data)
 		fmt.Printf("ASCII (Approx): %s\n", string(data))
 
 	case "read-meta":
 		if *index < 0 {
-			log.Fatal("Please provide -index for read-meta action")
+			return fmt.Errorf("please provide -index for read-meta action")
 		}
 		fmt.Printf("Reading message meta at index %d...\n", *index)
 		tagVal, ok, data, err := wms.RawReadMessageMeta(ctx, uint8(*storage), uint32(*index))
 		if err != nil {
-			log.Fatalf("Failed to read message: %v", err)
+			return fmt.Errorf("failed to read message: %w", err)
 		}
 		if ok {
 			fmt.Printf("Tag: %d\n", tagVal)
@@ -99,12 +106,12 @@ func main() {
 
 	case "delete":
 		if *index < 0 {
-			log.Fatal("Please provide -index for delete action")
+			return fmt.Errorf("please provide -index for delete action")
 		}
 		fmt.Printf("Deleting message at index %d (storage: %d)...\n", *index, *storage)
 		err := wms.DeleteMessage(ctx, uint8(*storage), uint32(*index))
 		if err != nil {
-			log.Fatalf("Failed to delete message: %v", err)
+			return fmt.Errorf("failed to delete message: %w", err)
 		}
 		fmt.Println("Message deleted successfully")
 
@@ -112,13 +119,13 @@ func main() {
 		fmt.Printf("Deleting messages by tag %d (storage: %d)...\n", *tag, *storage)
 		err := wms.DeleteMessagesByTag(ctx, uint8(*storage), qmi.MessageTagType(*tag), qmi.MessageModeGW)
 		if err != nil {
-			log.Fatalf("Failed to delete messages by tag: %v", err)
+			return fmt.Errorf("failed to delete messages by tag: %w", err)
 		}
 		fmt.Println("Messages deleted successfully")
 
 	case "modify-tag":
 		if *index < 0 {
-			log.Fatal("Please provide -index for modify-tag action")
+			return fmt.Errorf("please provide -index for modify-tag action")
 		}
 		beforeTag, beforeOk, _, _ := wms.RawReadMessageMeta(ctx, uint8(*storage), uint32(*index))
 		if beforeOk {
@@ -126,7 +133,7 @@ func main() {
 		}
 		fmt.Printf("Modifying message tag at index %d to %d (storage: %d)...\n", *index, *tag, *storage)
 		if err := wms.ModifyMessageTag(ctx, uint8(*storage), uint32(*index), qmi.MessageTagType(*tag)); err != nil {
-			log.Fatalf("Failed to modify message tag: %v", err)
+			return fmt.Errorf("failed to modify message tag: %w", err)
 		}
 		afterTag, afterOk, _, _ := wms.RawReadMessageMeta(ctx, uint8(*storage), uint32(*index))
 		if afterOk {
@@ -136,7 +143,7 @@ func main() {
 
 	case "mark-read":
 		if *index < 0 {
-			log.Fatal("Please provide -index for mark-read action")
+			return fmt.Errorf("please provide -index for mark-read action")
 		}
 		beforeTag, beforeOk, _, _ := wms.RawReadMessageMeta(ctx, uint8(*storage), uint32(*index))
 		if beforeOk {
@@ -144,7 +151,7 @@ func main() {
 		}
 		fmt.Printf("Marking message as read at index %d (storage: %d)...\n", *index, *storage)
 		if err := wms.ModifyMessageTag(ctx, uint8(*storage), uint32(*index), qmi.TagTypeMTRead); err != nil {
-			log.Fatalf("Failed to mark message as read: %v", err)
+			return fmt.Errorf("failed to mark message as read: %w", err)
 		}
 		afterTag, afterOk, _, _ := wms.RawReadMessageMeta(ctx, uint8(*storage), uint32(*index))
 		if afterOk {
@@ -156,13 +163,14 @@ func main() {
 		fmt.Println("Getting SMSC Address...")
 		addr, err := wms.GetSMSCAddress(ctx)
 		if err != nil {
-			log.Fatalf("Failed to get SMSC address: %v", err)
+			return fmt.Errorf("failed to get SMSC address: %w", err)
 		}
 		fmt.Printf("SMSC Address: %s\n", addr)
 
 	default:
-		log.Fatalf("Unknown action: %s", *action)
+		return fmt.Errorf("unknown action: %s", *action)
 	}
+	return nil
 }
 
 func defaultQmiDevice() string {

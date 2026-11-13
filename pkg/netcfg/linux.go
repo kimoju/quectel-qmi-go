@@ -4,6 +4,7 @@
 package netcfg
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -11,14 +12,19 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/kimoju/netlink"
 )
 
+const defaultRouteMetric = 512
+
+var resolvConfMu sync.Mutex
+
 // LinuxConfigurator implements NetworkConfigurator for Linux using netlink
 // LinuxConfigurator 使用 netlink 实现 Linux 的 NetworkConfigurator
 type LinuxConfigurator struct {
-	dnsMu          sync.Mutex
+	RouteMetric    int
 	resolvConfPath string
 	sysClassNetDir string
 	parentIndexFn  func(muxIface, masterIface string) (bool, bool)
@@ -26,6 +32,13 @@ type LinuxConfigurator struct {
 
 func NewLinuxConfigurator() *LinuxConfigurator {
 	return &LinuxConfigurator{}
+}
+
+func (l *LinuxConfigurator) routeMetric() int {
+	if l != nil && l.RouteMetric > 0 {
+		return l.RouteMetric
+	}
+	return defaultRouteMetric
 }
 
 func (l *LinuxConfigurator) resolvPath() string {
@@ -42,23 +55,36 @@ func (l *LinuxConfigurator) sysNetDir() string {
 	return defaultSysClassNetDir
 }
 
+func isLinkNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	var lnf netlink.LinkNotFoundError
+	return errors.As(err, &lnf) ||
+		errors.Is(err, syscall.ENODEV) ||
+		errors.Is(err, syscall.ENOENT) ||
+		os.IsNotExist(err)
+}
+
 func (l *LinuxConfigurator) SetIPAddress(ifname string, ip net.IP, prefixLen int) error {
 	link, err := netlink.LinkByName(ifname)
 	if err != nil {
 		return fmt.Errorf("interface %s not found: %w", ifname, err)
 	}
 
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return fmt.Errorf("invalid IPv4 address: %v", ip)
+	}
 	ipNet := &net.IPNet{
-		IP:   ip,
+		IP:   ip4,
 		Mask: net.CIDRMask(prefixLen, 32),
 	}
 
 	addr := &netlink.Addr{IPNet: ipNet}
 
-	if err := netlink.AddrAdd(link, addr); err != nil {
-		if !strings.Contains(err.Error(), "exists") {
-			return fmt.Errorf("failed to add address: %w", err)
-		}
+	if err := netlink.AddrReplace(link, addr); err != nil && !errors.Is(err, syscall.EEXIST) {
+		return fmt.Errorf("failed to set IPv4 address: %w", err)
 	}
 	return nil
 }
@@ -69,17 +95,19 @@ func (l *LinuxConfigurator) SetIPv6Address(ifname string, ip net.IP, prefixLen i
 		return fmt.Errorf("interface %s not found: %w", ifname, err)
 	}
 
+	ip16 := ip.To16()
+	if ip16 == nil || ip.To4() != nil {
+		return fmt.Errorf("invalid IPv6 address: %v", ip)
+	}
 	ipNet := &net.IPNet{
-		IP:   ip,
+		IP:   ip16,
 		Mask: net.CIDRMask(prefixLen, 128),
 	}
 
 	addr := &netlink.Addr{IPNet: ipNet}
 
-	if err := netlink.AddrAdd(link, addr); err != nil {
-		if !strings.Contains(err.Error(), "exists") {
-			return fmt.Errorf("failed to add IPv6 address: %w", err)
-		}
+	if err := netlink.AddrReplace(link, addr); err != nil && !errors.Is(err, syscall.EEXIST) {
+		return fmt.Errorf("failed to set IPv6 address: %w", err)
 	}
 	return nil
 }
@@ -102,29 +130,89 @@ func (l *LinuxConfigurator) FlushAddresses(ifname string) error {
 	return nil
 }
 
+func buildGatewayDefaultRoute(linkIndex int, gateway net.IP, metric int) *netlink.Route {
+	var dst *net.IPNet
+	var gw net.IP
+	if v4 := gateway.To4(); v4 != nil {
+		dst = &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}
+		gw = v4
+	} else {
+		dst = &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)}
+		gw = gateway.To16()
+	}
+	flags := 0
+	if !gw.IsLinkLocalUnicast() {
+		// Cellular Raw-IP / PtP PDNs frequently assign off-subnet gateways (/32 or /128).
+		flags = int(netlink.FLAG_ONLINK)
+	}
+	return &netlink.Route{
+		LinkIndex: linkIndex,
+		Dst:       dst,
+		Gw:        gw,
+		Priority:  metric,
+		Flags:     flags,
+	}
+}
+
+func buildDirectDefaultRoute(linkIndex int, ipv6 bool, metric int) *netlink.Route {
+	var dst *net.IPNet
+	if ipv6 {
+		dst = &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)}
+	} else {
+		dst = &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}
+	}
+	return &netlink.Route{
+		LinkIndex: linkIndex,
+		Dst:       dst,
+		Priority:  metric,
+	}
+}
+
 func (l *LinuxConfigurator) AddDefaultRoute(ifname string, gateway net.IP) error {
 	link, err := netlink.LinkByName(ifname)
 	if err != nil {
 		return fmt.Errorf("interface %s not found: %w", ifname, err)
 	}
 
-	var dst *net.IPNet
-	if gateway.To4() != nil {
-		dst = &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}
-	} else {
-		dst = &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)}
+	if len(gateway) == 0 || gateway.IsUnspecified() {
+		addrs, addrErr := netlink.AddrList(link, netlink.FAMILY_ALL)
+		hasV4, hasV6 := false, false
+		if addrErr == nil {
+			for _, ip := range selectGlobalInterfaceIPs(addrs) {
+				if ip.To4() != nil {
+					hasV4 = true
+				} else {
+					hasV6 = true
+				}
+			}
+		}
+		if !hasV4 && !hasV6 {
+			hasV4 = true
+		}
+		if hasV4 {
+			if err := l.AddDefaultRouteDirect(ifname, false); err != nil {
+				return err
+			}
+		}
+		if hasV6 {
+			if err := l.AddDefaultRouteDirect(ifname, true); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 
-	route := &netlink.Route{
-		LinkIndex: link.Attrs().Index,
-		Dst:       dst,
-		Gw:        gateway,
-		Priority:  5000, // High metric to avoid overriding system default route / 高跃点数避免覆盖系统默认路由
-	}
-
-	if err := netlink.RouteAdd(route); err != nil {
-		if !strings.Contains(err.Error(), "exists") {
-			return fmt.Errorf("failed to add default route: %w", err)
+	route := buildGatewayDefaultRoute(link.Attrs().Index, gateway, l.routeMetric())
+	if err := netlink.RouteReplace(route); err != nil {
+		if errors.Is(err, syscall.EINVAL) && route.Flags != 0 {
+			fallback := *route
+			fallback.Flags = 0
+			if retryErr := netlink.RouteReplace(&fallback); retryErr == nil || errors.Is(retryErr, syscall.EEXIST) {
+				return nil
+			}
+		}
+		if !errors.Is(err, syscall.EEXIST) {
+			return fmt.Errorf("failed to replace default route: %w", err)
 		}
 	}
 	return nil
@@ -136,23 +224,9 @@ func (l *LinuxConfigurator) AddDefaultRouteDirect(ifname string, ipv6 bool) erro
 		return fmt.Errorf("interface %s not found: %w", ifname, err)
 	}
 
-	var dst *net.IPNet
-	if ipv6 {
-		dst = &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)}
-	} else {
-		dst = &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}
-	}
-
-	route := &netlink.Route{
-		LinkIndex: link.Attrs().Index,
-		Dst:       dst,
-		Priority:  512, // High metric / 高跃点数
-	}
-
-	if err := netlink.RouteAdd(route); err != nil {
-		if !strings.Contains(err.Error(), "exists") {
-			return fmt.Errorf("failed to add default route: %w", err)
-		}
+	route := buildDirectDefaultRoute(link.Attrs().Index, ipv6, l.routeMetric())
+	if err := netlink.RouteReplace(route); err != nil && !errors.Is(err, syscall.EEXIST) {
+		return fmt.Errorf("failed to replace direct default route: %w", err)
 	}
 	return nil
 }
@@ -160,11 +234,17 @@ func (l *LinuxConfigurator) AddDefaultRouteDirect(ifname string, ipv6 bool) erro
 func (l *LinuxConfigurator) FlushRoutes(ifname string) error {
 	link, err := netlink.LinkByName(ifname)
 	if err != nil {
+		if isLinkNotFound(err) {
+			return nil
+		}
 		return fmt.Errorf("interface %s not found: %w", ifname, err)
 	}
 
 	routes, err := netlink.RouteList(link, netlink.FAMILY_ALL)
 	if err != nil {
+		if isLinkNotFound(err) {
+			return nil
+		}
 		return fmt.Errorf("failed to list routes: %w", err)
 	}
 
@@ -198,21 +278,54 @@ func (l *LinuxConfigurator) SetMTU(ifname string, mtu int) error {
 	return netlink.LinkSetMTU(link, mtu)
 }
 
-func (l *LinuxConfigurator) GetCurrentIP(ifname string) (net.IP, error) {
+func selectGlobalInterfaceIPs(addrs []netlink.Addr) []net.IP {
+	var v4s []net.IP
+	var v6s []net.IP
+	for _, addr := range addrs {
+		ip := addr.IP
+		if len(ip) == 0 || ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() {
+			continue
+		}
+		if v4 := ip.To4(); v4 != nil {
+			if v4.IsLinkLocalUnicast() {
+				continue
+			}
+			v4s = append(v4s, v4)
+			continue
+		}
+		if v6 := ip.To16(); v6 != nil {
+			if v6.IsLinkLocalUnicast() || v6.IsLinkLocalMulticast() {
+				continue
+			}
+			v6s = append(v6s, v6)
+		}
+	}
+	out := make([]net.IP, 0, len(v4s)+len(v6s))
+	out = append(out, v4s...)
+	out = append(out, v6s...)
+	return out
+}
+
+func (l *LinuxConfigurator) GetCurrentIPs(ifname string) ([]net.IP, error) {
 	link, err := netlink.LinkByName(ifname)
 	if err != nil {
 		return nil, fmt.Errorf("interface %s not found: %w", ifname, err)
 	}
 
-	addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_ALL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list addresses: %w", err)
 	}
 
-	if len(addrs) == 0 {
-		return nil, nil
+	return selectGlobalInterfaceIPs(addrs), nil
+}
+
+func (l *LinuxConfigurator) GetCurrentIP(ifname string) (net.IP, error) {
+	ips, err := l.GetCurrentIPs(ifname)
+	if err != nil || len(ips) == 0 {
+		return nil, err
 	}
-	return addrs[0].IP, nil
+	return ips[0], nil
 }
 
 func (l *LinuxConfigurator) IsUp(ifname string) (bool, error) {
@@ -253,14 +366,84 @@ func splitResolvLines(data []byte) []string {
 	return strings.Split(raw, "\n")
 }
 
+func resolveWritableResolvPath(path string) (string, error) {
+	current := path
+	for depth := 0; depth < 16; depth++ {
+		fi, err := os.Lstat(current)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return current, nil
+			}
+			return "", err
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			return current, nil
+		}
+		target, err := os.Readlink(current)
+		if err != nil {
+			return "", err
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(current), target)
+		}
+		current = filepath.Clean(target)
+	}
+	return "", fmt.Errorf("too many symlink levels resolving %s", path)
+}
+
+func writeResolvFileSafe(path string, content []byte) error {
+	realPath, err := resolveWritableResolvPath(path)
+	if err != nil {
+		return err
+	}
+	mode := os.FileMode(0644)
+	if fi, statErr := os.Stat(realPath); statErr == nil {
+		mode = fi.Mode().Perm()
+	}
+	dir := filepath.Dir(realPath)
+	tmpFile, tmpErr := os.CreateTemp(dir, ".resolv.conf.qmi-*")
+	if tmpErr != nil {
+		// Fallback to direct write if directory does not permit temporary files (e.g. bind-mounted single file).
+		return os.WriteFile(realPath, content, mode)
+	}
+	tmpName := tmpFile.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmpFile.Write(content); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Chmod(mode); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, realPath); err != nil {
+		// Cross-device or bind-mount fallback: write directly to resolved target without clobbering symlink.
+		return os.WriteFile(realPath, content, mode)
+	}
+	cleanupTmp = false
+	return nil
+}
+
 func (l *LinuxConfigurator) UpdateDNS(dns1, dns2 string) error {
-	servers := collectDNSServers(dns1, dns2)
+	return l.UpdateDNSServers(dns1, dns2)
+}
+
+func (l *LinuxConfigurator) UpdateDNSServers(rawServers ...string) error {
+	servers := normalizeDNSServerList(rawServers...)
 	if len(servers) == 0 {
 		return nil
 	}
 
-	l.dnsMu.Lock()
-	defer l.dnsMu.Unlock()
+	resolvConfMu.Lock()
+	defer resolvConfMu.Unlock()
 
 	path := l.resolvPath()
 	var existingLines []string
@@ -302,12 +485,12 @@ func (l *LinuxConfigurator) UpdateDNS(dns1, dns2 string) error {
 	out = append(out, managedDNSEndMarker)
 
 	content := strings.Join(out, "\n") + "\n"
-	return os.WriteFile(path, []byte(content), 0644)
+	return writeResolvFileSafe(path, []byte(content))
 }
 
 func (l *LinuxConfigurator) RestoreDNS() error {
-	l.dnsMu.Lock()
-	defer l.dnsMu.Unlock()
+	resolvConfMu.Lock()
+	defer resolvConfMu.Unlock()
 
 	path := l.resolvPath()
 	data, err := os.ReadFile(path)
@@ -357,7 +540,7 @@ func (l *LinuxConfigurator) RestoreDNS() error {
 	if len(out) > 0 {
 		content = strings.Join(out, "\n") + "\n"
 	}
-	return os.WriteFile(path, []byte(content), 0644)
+	return writeResolvFileSafe(path, []byte(content))
 }
 
 // ============================================================================

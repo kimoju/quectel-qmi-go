@@ -62,6 +62,9 @@ type DataFormat struct {
 	LinkProtocol      uint32
 	UlDataAggregation uint32
 	DlDataAggregation uint32
+	EndpointType      uint32
+	EndpointID        uint32
+	HasEndpoint       bool
 }
 
 type DataFormatDetails struct {
@@ -73,9 +76,14 @@ type DataFormatDetails struct {
 
 	DlMaxDatagrams uint32
 	DlMaxSize      uint32
+	UlMaxDatagrams uint32
+	UlMaxSize      uint32
 
+	// Deprecated: QMI_WDA_GET_DATA_FORMAT (0x0021) responses do not carry
+	// peripheral endpoint IDs; TLVs 0x17 and 0x18 are UlMaxDatagrams and UlMaxSize.
 	EndpointType uint32
 	EndpointID   uint32
+	HasEndpoint  bool
 }
 
 // QMAPSettings configures QMAP (Qualcomm Mobile Access Point) parameters / QMAPSettings 配置 QMAP 参数
@@ -92,13 +100,11 @@ type LoopbackConfig struct {
 // SetDataFormat sets the data format (e.g. Raw IP) / SetDataFormat设置数据格式 (例如 原始IP)
 func (s *WDAService) SetDataFormat(ctx context.Context, format DataFormat) error {
 	var endpointTLV *TLV
-	if current, err := s.GetDataFormatDetails(ctx); err == nil {
-		if current.EndpointType != 0 && current.EndpointID != 0 {
-			buf := make([]byte, 8)
-			binary.LittleEndian.PutUint32(buf[0:4], current.EndpointType)
-			binary.LittleEndian.PutUint32(buf[4:8], current.EndpointID)
-			endpointTLV = &TLV{Type: 0x17, Value: buf}
-		}
+	if format.HasEndpoint || format.EndpointType != 0 || format.EndpointID != 0 {
+		buf := make([]byte, 8)
+		binary.LittleEndian.PutUint32(buf[0:4], format.EndpointType)
+		binary.LittleEndian.PutUint32(buf[4:8], format.EndpointID)
+		endpointTLV = &TLV{Type: 0x17, Value: buf}
 	}
 
 	bufLink := make([]byte, 4)
@@ -121,7 +127,10 @@ func (s *WDAService) SetDataFormat(ctx context.Context, format DataFormat) error
 		baseTLVs,
 	}
 	if endpointTLV != nil {
-		attempts = append([][]TLV{append(append([]TLV{}, baseTLVs...), *endpointTLV)}, attempts...)
+		attempts = [][]TLV{
+			append(append([]TLV{}, baseTLVs...), *endpointTLV),
+			baseTLVs,
+		}
 	}
 
 	var lastErr error
@@ -158,7 +167,13 @@ func (s *WDAService) GetDataFormatDetails(ctx context.Context) (*DataFormatDetai
 	if err != nil {
 		return nil, err
 	}
+	return parseWDADataFormatDetailsResponse(resp)
+}
 
+func parseWDADataFormatDetailsResponse(resp *Packet) (*DataFormatDetails, error) {
+	if resp == nil {
+		return nil, fmt.Errorf("wda get data format response is nil")
+	}
 	if err := resp.CheckResult(); err != nil {
 		return nil, err
 	}
@@ -184,10 +199,10 @@ func (s *WDAService) GetDataFormatDetails(ctx context.Context) (*DataFormatDetai
 		format.DlMaxSize = binary.LittleEndian.Uint32(tlv.Value)
 	}
 	if tlv := FindTLV(resp.TLVs, 0x17); tlv != nil && len(tlv.Value) >= 4 {
-		format.EndpointType = binary.LittleEndian.Uint32(tlv.Value)
+		format.UlMaxDatagrams = binary.LittleEndian.Uint32(tlv.Value)
 	}
 	if tlv := FindTLV(resp.TLVs, 0x18); tlv != nil && len(tlv.Value) >= 4 {
-		format.EndpointID = binary.LittleEndian.Uint32(tlv.Value)
+		format.UlMaxSize = binary.LittleEndian.Uint32(tlv.Value)
 	}
 
 	return format, nil

@@ -46,6 +46,9 @@ func serveUIMUnitTestRequests(t *testing.T, c *Client, handler func(*Packet) *Pa
 				entry := c.transactions[key]
 				c.mu.Unlock()
 				if entry == nil {
+					if c.isRecentTransaction(key, req.ServiceType, req.MessageID) {
+						continue
+					}
 					t.Errorf("response channel not found for key=0x%08x", key)
 					continue
 				}
@@ -53,7 +56,10 @@ func serveUIMUnitTestRequests(t *testing.T, c *Client, handler func(*Packet) *Pa
 				resp.ClientID = req.ClientID
 				resp.TransactionID = req.TransactionID
 				resp.MessageID = req.MessageID
-				entry.ch <- resp
+				select {
+				case entry.ch <- resp:
+				default:
+				}
 			}
 		}
 	}()

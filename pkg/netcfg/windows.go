@@ -24,73 +24,59 @@ func (w *WindowsConfigurator) run(args ...string) error {
 }
 
 func (w *WindowsConfigurator) SetIPAddress(ifname string, ip net.IP, prefixLen int) error {
-	// netsh interface ip set address "ifname" static IP Mask Gateway
 	mask := net.IP(net.CIDRMask(prefixLen, 32)).String()
-	// Note: We don't set gateway here, it's done in AddDefaultRoute
-	// 注意: 我们不在这里设置网关，它在 AddDefaultRoute 中完成
-	return w.run("interface", "ip", "set", "address", fmt.Sprintf("\"%s\"", ifname), "static", ip.String(), mask)
+	return w.run("interface", "ipv4", "set", "address", "name="+ifname, "source=static", "addr="+ip.String(), "mask="+mask)
 }
 
 func (w *WindowsConfigurator) SetIPv6Address(ifname string, ip net.IP, prefixLen int) error {
-	// netsh interface ipv6 add address "ifname" IP/Prefix
-	return w.run("interface", "ipv6", "add", "address", fmt.Sprintf("\"%s\"", ifname), fmt.Sprintf("%s/%d", ip.String(), prefixLen))
+	return w.run("interface", "ipv6", "add", "address", ifname, fmt.Sprintf("%s/%d", ip.String(), prefixLen))
 }
 
 func (w *WindowsConfigurator) FlushAddresses(ifname string) error {
-	// Reset to DHCP is the easiest way to clear static IPs on Windows
-	// 在 Windows 上清除静态 IP 最简单的方法是重置为 DHCP
-	_ = w.run("interface", "ip", "set", "address", fmt.Sprintf("\"%s\"", ifname), "dhcp")
-	_ = w.run("interface", "ipv6", "set", "address", fmt.Sprintf("\"%s\"", ifname), "dhcp")
+	_ = w.run("interface", "ipv4", "set", "address", "name="+ifname, "source=dhcp")
+	_ = w.run("interface", "ipv6", "set", "address", ifname, "dhcp")
 	return nil
 }
 
 func (w *WindowsConfigurator) AddDefaultRoute(ifname string, gateway net.IP) error {
-	// Gateway is usually set with IP address in Windows, but can be added separately
-	// Windows 中网关通常与 IP 地址一起设置，但也可以单独添加
-	if gateway.To4() != nil {
-		return w.run("interface", "ip", "add", "address", fmt.Sprintf("\"%s\"", ifname), "gateway="+gateway.String(), "gwmetric=1")
+	if len(gateway) == 0 || gateway.IsUnspecified() {
+		return w.AddDefaultRouteDirect(ifname, false)
 	}
-	// IPv6 route
-	return w.run("interface", "ipv6", "add", "route", "::/0", fmt.Sprintf("\"%s\"", ifname), "nexthop="+gateway.String())
+	if gateway.To4() != nil {
+		return w.run("interface", "ipv4", "add", "route", "0.0.0.0/0", ifname, "nexthop="+gateway.String())
+	}
+	return w.run("interface", "ipv6", "add", "route", "::/0", ifname, "nexthop="+gateway.String())
 }
 
 func (w *WindowsConfigurator) AddDefaultRouteDirect(ifname string, ipv6 bool) error {
-	// Interface-based route
 	if ipv6 {
-		return w.run("interface", "ipv6", "add", "route", "::/0", fmt.Sprintf("\"%s\"", ifname))
+		return w.run("interface", "ipv6", "add", "route", "::/0", ifname)
 	}
-	return w.run("interface", "ip", "add", "route", "0.0.0.0/0", fmt.Sprintf("\"%s\"", ifname))
+	return w.run("interface", "ipv4", "add", "route", "0.0.0.0/0", ifname)
 }
 
 func (w *WindowsConfigurator) FlushRoutes(ifname string) error {
-	// Removing IP address usually clears routes, but we can try explicit delete
-	// 移除 IP 地址通常会清除路由，但我们可以尝试显式删除
-	_ = w.run("interface", "ip", "delete", "route", "0.0.0.0/0", fmt.Sprintf("\"%s\"", ifname))
-	_ = w.run("interface", "ipv6", "delete", "route", "::/0", fmt.Sprintf("\"%s\"", ifname))
+	_ = w.run("interface", "ipv4", "delete", "route", "0.0.0.0/0", ifname)
+	_ = w.run("interface", "ipv6", "delete", "route", "::/0", ifname)
 	return nil
 }
 
 func (w *WindowsConfigurator) BringUp(ifname string) error {
-	return w.run("interface", "set", "interface", fmt.Sprintf("\"%s\"", ifname), "admin=enable")
+	return w.run("interface", "set", "interface", ifname, "admin=enable")
 }
 
 func (w *WindowsConfigurator) BringDown(ifname string) error {
-	return w.run("interface", "set", "interface", fmt.Sprintf("\"%s\"", ifname), "admin=disable")
+	return w.run("interface", "set", "interface", ifname, "admin=disable")
 }
 
 func (w *WindowsConfigurator) SetMTU(ifname string, mtu int) error {
-	// netsh interface ipv4 set subinterface "ifname" mtu=1500 store=persistent
-	if err := w.run("interface", "ipv4", "set", "subinterface", fmt.Sprintf("\"%s\"", ifname), "mtu="+strconv.Itoa(mtu), "store=persistent"); err != nil {
+	if err := w.run("interface", "ipv4", "set", "subinterface", ifname, "mtu="+strconv.Itoa(mtu), "store=persistent"); err != nil {
 		return err
 	}
-	return w.run("interface", "ipv6", "set", "subinterface", fmt.Sprintf("\"%s\"", ifname), "mtu="+strconv.Itoa(mtu), "store=persistent")
+	return w.run("interface", "ipv6", "set", "subinterface", ifname, "mtu="+strconv.Itoa(mtu), "store=persistent")
 }
 
-func (w *WindowsConfigurator) GetCurrentIP(ifname string) (net.IP, error) {
-	// Parsing `netsh interface ip show config "ifname"` is painful.
-	// Using Go's standard library is better for reading.
-	// 解析 `netsh interface ip show config "ifname"` 很痛苦。
-	// 使用 Go 的标准库读取更好。
+func (w *WindowsConfigurator) GetCurrentIPs(ifname string) ([]net.IP, error) {
 	iface, err := net.InterfaceByName(ifname)
 	if err != nil {
 		return nil, err
@@ -99,14 +85,31 @@ func (w *WindowsConfigurator) GetCurrentIP(ifname string) (net.IP, error) {
 	if err != nil {
 		return nil, err
 	}
+	var v4s, v6s []net.IP
 	for _, addr := range addrs {
-		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ipnet.IP.To4() != nil {
-				return ipnet.IP, nil
+		ipnet, ok := addr.(*net.IPNet)
+		if !ok || len(ipnet.IP) == 0 || ipnet.IP.IsLoopback() || ipnet.IP.IsUnspecified() || ipnet.IP.IsMulticast() {
+			continue
+		}
+		if v4 := ipnet.IP.To4(); v4 != nil {
+			if !v4.IsLinkLocalUnicast() {
+				v4s = append(v4s, v4)
 			}
+			continue
+		}
+		if v6 := ipnet.IP.To16(); v6 != nil && !v6.IsLinkLocalUnicast() && !v6.IsLinkLocalMulticast() {
+			v6s = append(v6s, v6)
 		}
 	}
-	return nil, nil
+	return append(v4s, v6s...), nil
+}
+
+func (w *WindowsConfigurator) GetCurrentIP(ifname string) (net.IP, error) {
+	ips, err := w.GetCurrentIPs(ifname)
+	if err != nil || len(ips) == 0 {
+		return nil, err
+	}
+	return ips[0], nil
 }
 
 func (w *WindowsConfigurator) IsUp(ifname string) (bool, error) {
